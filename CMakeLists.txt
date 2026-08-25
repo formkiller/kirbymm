@@ -30,6 +30,9 @@ add_library(naive STATIC test/naive.c)
 # ---- SVL/SME 探测工具 (已完成) ----
 add_executable(svl_probe tools/svl_probe.c)
 
+# ---- fmopa 计算正确性 + ZA slice read 语法验证 ----
+add_executable(fmopa_sanity tools/fmopa_sanity.c)
+
 # ---- 正确性验证工具 ----
 add_executable(verify test/verify.c)
 target_link_libraries(verify PRIVATE naive m)
