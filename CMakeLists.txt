@@ -33,27 +33,10 @@ add_executable(svl_probe tools/svl_probe.c)
 # ---- fmopa 计算正确性 + ZA slice read 语法验证 ----
 add_executable(fmopa_sanity tools/fmopa_sanity.c)
 
-# ---- 正确性验证工具 ----
+# ---- 正确性验证 (ref=naive, test=kirby) ----
 add_executable(verify test/verify.c)
-target_link_libraries(verify PRIVATE naive m)
+target_link_libraries(verify PRIVATE kirbymm m)
 
-# ---- 后续: KirbyMM 库 (待实现) ----
-# 取消注释并填充源文件即可接入:
-#
-# add_library(kirbymm
-#     platform/detect.c
-#     macro/partition.c
-#     macro/loop.c
-#     packing/pack.c
-#     micro/primary.c
-#     micro/dedicated.c
-# )
-# target_include_directories(kirbymm PUBLIC include)
-#
-# # 用 KirbyMM 替换 naive 作为被测实现
-# # verify.c 里把 test = naive_sgemm_fp32 改成 test = kirby_sgemm_fp32
-# target_link_libraries(verify PRIVATE kirbymm m)
-#
-# # 性能基准
-# add_executable(bench test/bench.c)
-# target_link_libraries(bench PRIVATE kirbymm naive m)
+# ---- KirbyMM 库 (主例程, 当前 16x16 单瓦片, fallback naive) ----
+add_library(kirbymm micro/primary.c)
+target_link_libraries(kirbymm PUBLIC naive)

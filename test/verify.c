@@ -85,18 +85,18 @@ static int run_case(int M, int N, int K,
 int main(void) {
     printf("=== KirbyMM correctness verification ===\n\n");
 
-    /* ref = naive, test = naive (自对照, 验证框架) */
+    /* ref = naive, test = kirby (M=16 走 SME, 其他 fallback naive 自对照) */
     gemm_fn_t ref  = naive_sgemm_fp32;
-    gemm_fn_t test = naive_sgemm_fp32;
+    gemm_fn_t test = kirby_sgemm_fp32;
 
     /* 测试用例集 */
     struct { int M, N, K; const char *note; } cases[] = {
-        { 64,  64,  64, "aligned"      },
-        {128, 128, 128, "aligned"      },
-        {256, 256, 256, "aligned"      },
-        { 35,  32,  32, "edge (Fig.8)" },
-        { 17,  16,  16, "small edge"   },
-        { 48,  48,  48, "unaligned"    },
+        { 16,  16,  16, "kirby 16x16"   },  /* SME 路径 */
+        { 16,  16,  32, "kirby 16x16x32" },  /* SME, K>16 */
+        { 16,  16,  64, "kirby 16x16x64" },  /* SME, K=64 */
+        { 64,  64,  64, "fallback naive" },
+        {128, 128, 128, "fallback naive" },
+        { 35,  32,  32, "edge fallback"  },
         {1024,1024,1024, "large"       },
     };
     int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
@@ -110,12 +110,7 @@ int main(void) {
 
     printf("\n=== result: %s ===\n", all_pass ? "ALL PASS" : "SOME FAILED");
 
-    /* 后续接入 KirbyMM 时:
-     *   gemm_fn_t test = kirby_sgemm_fp32;
-     *   重新编译链接, 即可对照 KirbyMM vs naive
-     */
-    printf("\n(note: currently naive vs naive self-check.\n"
-           " to verify KirbyMM: change test fn to kirby_sgemm_fp32)\n");
+    printf("\n(note: ref=naive, test=kirby. M=16 cases go SME path, others fallback naive.)\n");
 
     return all_pass ? 0 : 1;
 }
