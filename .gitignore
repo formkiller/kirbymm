@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Compiled binaries
+svl_probe
+verify
+naive_gemm
+bench
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
