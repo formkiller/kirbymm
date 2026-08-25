@@ -1,23 +1,15 @@
 /*
- * fmopa_sanity.c — fmopa 计算正确性 + ZA slice read 语法验证
- *
- * 目的: 在写完整 microkernel 前, 验证 fmopa 累加语义 + ZA slice read 汇编语法正确
+ * fmopa_sanity.c — fmopa 计算正确性 + ZA slice read 语法验证 (v2: 带 z0 调试)
  *
  * 测试逻辑:
- *   z0 = [1, 2, 3, ..., 16]   (index z0.s, #1, #1)
- *   z1 = [1, 2, 3, ..., 16]   (index z1.s, #1, #1)
- *   fmopa za0.s, p0/m, p0/m, z0.s, z1.s
- *     → za0[i][j] = z0[i] * z1[j] = (i+1) * (j+1)
- *   mova z2.s, p0/m, za0h.s[0]   (读 za0 水平 slice 0 = 第 0 行)
- *     → z2 = [za0[0][0], za0[0][1], ..., za0[0][15]]
- *            = [1*1, 1*2, ..., 1*16] = [1, 2, ..., 16]
- *   st1w z2 → out[0..15]
- *   期望 out = [1, 2, ..., 16]
+ *   z0 = [1, 2, ..., 16]   (index z0.s, #1, #1)
+ *   z1 = [1, 2, ..., 16]   (index z1.s, #1, #1)
+ *   fmopa za0 → za0[i][j] = (i+1)*(j+1)
+ *   mova za0h slice 0 → 期望 [1, 2, ..., 16]
  *
- * 若 out 正确: fmopa 语义对, ZA slice read 语法对 → 可推进 micro/primary.c
- * 若 SIGILL: ZA slice 语法可能错, 需调整 mova 语法
- *
- * 编译: clang -std=c11 -O2 -arch arm64 fmopa_sanity.c -o fmopa_sanity
+ * v2 加调试: fmopa 前先存 z0 出来, 确认 index 在 streaming 模式内生效
+ *   - 若 z0 = [1..16] 但 za 全 0 → 问题在 fmopa 或 mova
+ *   - 若 z0 也全 0 → 问题在 index 或 st1w (streaming 内 SVE 指令链路)
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -49,26 +41,27 @@ static void restore_handler(const struct sigaction *old) {
 }
 
 __attribute__((target("sve,sme")))
-static int fmopa_sanity_test(float *out) {
+static int fmopa_sanity_test(float *z0_out, float *za_out) {
     struct sigaction old = install_handler();
     g_sigill = 0;
     int ok = 0;
     if (sigsetjmp(g_jmp, 1) == 0) {
         __asm__ volatile(
-            "smstart sm\n\t"                          /* 进入 streaming SVE 模式 */
-            "smstart za\n\t"                          /* 启用 ZA 阵列 */
-            "zero {za}\n\t"                           /* 清零整个 ZA (大括号包裹) */
-            "ptrue p0.s, all\n\t"                     /* 谓词 p0 全真 */
-            "index z0.s, #1, #1\n\t"                  /* z0 = [1,2,...,16] */
-            "index z1.s, #1, #1\n\t"                  /* z1 = [1,2,...,16] */
-            "fmopa za0.s, p0/m, p0/m, z0.s, z1.s\n\t" /* za0[i][j] += (i+1)*(j+1) */
-            "mov w12, #0\n\t"                         /* tile 偏移寄存器 = 0 (指向 za0) */
-            "mova z2.s, p0/m, za0h.s[w12, 0]\n\t"     /* 读 za0 水平 slice 0 (第0行) */
-            "st1w z2.s, p0, [%[out]]\n\t"             /* 存 16 个 FP32 到 out */
+            "smstart sm\n\t"
+            "smstart za\n\t"
+            "zero {za}\n\t"
+            "ptrue p0.s, all\n\t"
+            "index z0.s, #1, #1\n\t"
+            "index z1.s, #1, #1\n\t"
+            "st1w z0.s, p0, [%[z0o]]\n\t"            /* 调试: 存 z0 确认 index 生效 */
+            "fmopa za0.s, p0/m, p0/m, z0.s, z1.s\n\t"
+            "mov w12, #0\n\t"
+            "mova z2.s, p0/m, za0h.s[w12, 0]\n\t"     /* 读 za0 水平 slice 0 */
+            "st1w z2.s, p0, [%[zao]]\n\t"
             "smstop za\n\t"
             "smstop sm\n\t"
             :
-            : [out] "r" (out)
+            : [z0o] "r" (z0_out), [zao] "r" (za_out)
             : "memory", "w12"
         );
         ok = 1;
@@ -78,32 +71,53 @@ static int fmopa_sanity_test(float *out) {
 }
 
 int main(void) {
-    float out[16] = {0};
-    printf("=== fmopa sanity test ===\n\n");
+    float z0_out[16] = {0};
+    float za_out[16] = {0};
+    printf("=== fmopa sanity test (v2: with z0 debug) ===\n\n");
 
-    int ok = fmopa_sanity_test(out);
-    printf("fmopa + ZA slice read: %s\n\n", ok ? "executed" : "SIGILL");
+    int ok = fmopa_sanity_test(z0_out, za_out);
+    printf("executed: %s\n\n", ok ? "yes" : "SIGILL");
 
-    int correct = 0;
-    if (ok) {
-        printf("za0 horizontal slice 0 (expected 1..16):\n");
-        correct = 1;
-        for (int i = 0; i < 16; i++) {
-            int expected = i + 1;
-            int got = (int)(out[i] + 0.5f);
-            printf("  [%2d] = %6.2f  (expected %2d)  %s\n",
-                   i, (double)out[i], expected, got == expected ? "ok" : "MISMATCH");
-            if (got != expected) correct = 0;
-        }
-        printf("\nresult: %s\n", correct ? "CORRECT" : "WRONG");
-        if (correct) {
-            printf("\nif CORRECT: fmopa 计算语义正确, ZA slice read 语法正确\n");
-            printf("            → 可推进 micro/primary.c 完整 microkernel\n");
-        }
-    } else {
-        printf("SIGILL — 可能 ZA slice 语法不对, 或指令顺序问题\n");
-        printf("需调整 mova 语法 (如 za0h.s[w,0] 或 za0h.s[0,0])\n");
+    if (!ok) {
+        printf("SIGILL — ZA slice 语法或指令顺序问题\n");
+        return 1;
     }
 
-    return (ok && correct) ? 0 : 1;
+    /* 检查 z0 */
+    int z0_correct = 1;
+    printf("z0 (expected 1..16, 验证 index 在 streaming 内生效):\n");
+    for (int i = 0; i < 16; i++) {
+        int expected = i + 1;
+        int got = (int)(z0_out[i] + 0.5f);
+        printf("  [%2d] = %8.3f  (expected %2d)  %s\n",
+               i, (double)z0_out[i], expected, got == expected ? "ok" : "MISMATCH");
+        if (got != expected) z0_correct = 0;
+    }
+    printf("z0: %s\n\n", z0_correct ? "CORRECT" : "WRONG");
+
+    /* 检查 za slice */
+    int za_correct = 1;
+    printf("za0 horizontal slice 0 (expected 1..16):\n");
+    for (int i = 0; i < 16; i++) {
+        int expected = i + 1;
+        int got = (int)(za_out[i] + 0.5f);
+        printf("  [%2d] = %8.3f  (expected %2d)  %s\n",
+               i, (double)za_out[i], expected, got == expected ? "ok" : "MISMATCH");
+        if (got != expected) za_correct = 0;
+    }
+    printf("za: %s\n\n", za_correct ? "CORRECT" : "WRONG");
+
+    /* 诊断结论 */
+    printf("--- 诊断 ---\n");
+    if (z0_correct && za_correct) {
+        printf("ALL CORRECT → fmopa 语义 + ZA slice read 语法全对, 可推进 micro/primary.c\n");
+    } else if (!z0_correct) {
+        printf("z0 WRONG → index 或 st1w 在 streaming 模式内未生效\n");
+        printf("           可能 ptrue/index/st1w 链路有问题\n");
+    } else if (z0_correct && !za_correct) {
+        printf("z0 ok 但 za WRONG → fmopa 没累加到 za0, 或 mova 读错 tile/slice\n");
+        printf("           可能: fmopa 谓词/操作数顺序, 或 mova 的 w12/slice 索引语义\n");
+    }
+
+    return (z0_correct && za_correct) ? 0 : 1;
 }
