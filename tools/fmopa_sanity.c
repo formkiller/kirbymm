@@ -57,18 +57,19 @@ static int fmopa_sanity_test(float *out) {
         __asm__ volatile(
             "smstart sm\n\t"                          /* 进入 streaming SVE 模式 */
             "smstart za\n\t"                          /* 启用 ZA 阵列 */
-            "zero za\n\t"                             /* 清零整个 ZA */
+            "zero {za}\n\t"                           /* 清零整个 ZA (大括号包裹) */
             "ptrue p0.s, all\n\t"                     /* 谓词 p0 全真 */
             "index z0.s, #1, #1\n\t"                  /* z0 = [1,2,...,16] */
             "index z1.s, #1, #1\n\t"                  /* z1 = [1,2,...,16] */
             "fmopa za0.s, p0/m, p0/m, z0.s, z1.s\n\t" /* za0[i][j] += (i+1)*(j+1) */
-            "mova z2.s, p0/m, za0h.s[0]\n\t"          /* 读 za0 水平 slice 0 (第0行) */
+            "mov w12, #0\n\t"                         /* tile 偏移寄存器 = 0 (指向 za0) */
+            "mova z2.s, p0/m, za0h.s[w12, 0]\n\t"     /* 读 za0 水平 slice 0 (第0行) */
             "st1w z2.s, p0, [%[out]]\n\t"             /* 存 16 个 FP32 到 out */
             "smstop za\n\t"
             "smstop sm\n\t"
             :
             : [out] "r" (out)
-            : "memory"
+            : "memory", "w12"
         );
         ok = 1;
     }
