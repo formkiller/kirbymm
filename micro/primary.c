@@ -144,12 +144,25 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
     );
 }
 
-/* KirbyMM GEMM 入口 (论文 §IV-A + §V MacroKernel)
- * 当前: 32×32 块遍历 + pack A/B/C (简单实现, 后续按 §V-A/§V-B 优化)
+/* KirbyMM GEMM 入口 (论文 §IV-A + §V-A 严格复现)
+ * Goto 5 层循环 (算法 1), 参数由 Eq.5/6/7 联立求解:
+ *   blkm=blkn=128, blkk=128, si=sj=32 (microkernel 块)
+ *
+ * 循环结构:
+ *   L1 (j,  blkn=128): C 沿 N 顶层分块
+ *   L2 (k,  blkk=128): K 分块, B 面板 pack 驻留 L2
+ *   L3 (i,  blkm=128): M 分块, A 块 pack 驻留 L2
+ *   L4 (jj, sj=32):   blkn 内 N 再分块 (L2 驻留)
+ *   L5 (ii, si=32):   blkm 内 M 再分块 = microkernel (L1 驻留)
+ *
+ * Packing (论文 §V, 当前简单实现, §V-B 将用 ZA-tile 优化):
+ *   A_block: blkm×blkk, 按 32 行子块组织, 每子块 col-major 32×blkk (列距 32)
+ *   B_panel: blkk×blkn, 按 32 列子块组织, 每子块 row-major blkk×32 (行距 32)
+ *   C_blk:   32×32 连续, pack/unpack microkernel 用
+ *
  * M=N=16: 走 16×16 单瓦片 SME (验证用)
- * M,N 都是 32 倍数: 32×32 块遍历, 每块走 SME
- * 其他 (含边界): fallback naive
- * 完整 C += A*B 语义
+ * M,N 是 32 倍数: 走 5 层循环 (blkm/blkn 自适应 ≤128)
+ * 其他: fallback naive
  */
 void kirby_sgemm_fp32(int M, int N, int K,
                       const float *A, const float *B, float *C) {
@@ -164,39 +177,85 @@ void kirby_sgemm_fp32(int M, int N, int K,
         return;
     }
 
-    /* 非 32 倍数 (含边界) → naive 兜底 */
+    /* 非 32 倍数 → naive 兜底 */
     if (M % 32 != 0 || N % 32 != 0) {
         naive_sgemm_fp32(M, N, K, A, B, C);
         return;
     }
 
-    /* MacroKernel: 32×32 块遍历 (M, N 都是 32 倍数)
-     * 每块 pack A (转置 col-major) + pack B (跨 stride row-major) + pack/unpack C
-     * (后续 §V-A 求解 blkm/blkn/blkk, §V-B ZA-tile 隐式转置优化 packing) */
-    float *A_blk = (float *)malloc(sizeof(float) * 32 * (size_t)K);
-    float *B_blk = (float *)malloc(sizeof(float) * (size_t)K * 32);
-    float *C_blk = (float *)malloc(sizeof(float) * 32 * 32);
+    const int BLKM = 128, BLKN = 128, BLKK = 128, SI = 32, SJ = 32;
 
-    for (int ii = 0; ii < M; ii += 32) {
-        for (int jj = 0; jj < N; jj += 32) {
-            /* pack A[ii:ii+32, :] → col-major 32×K (转置) */
-            for (int k = 0; k < K; k++)
-                for (int i = 0; i < 32; i++)
-                    A_blk[k * 32 + i] = A[(ii + i) * K + k];
-            /* pack B[:, jj:jj+32] → row-major K×32 (跨 stride) */
-            for (int k = 0; k < K; k++)
-                for (int j = 0; j < 32; j++)
-                    B_blk[k * 32 + j] = B[k * N + (jj + j)];
-            /* pack C[ii:ii+32, jj:jj+32] → 连续 32×32 (加载初值) */
-            for (int i = 0; i < 32; i++)
-                memcpy(C_blk + i * 32, C + (ii + i) * N + jj, 32 * sizeof(float));
-            /* microkernel: C_blk += A_blk * B_blk */
-            micro_32x32_kupdate(C_blk, A_blk, B_blk, K);
-            /* unpack C_blk → 原 C */
-            for (int i = 0; i < 32; i++)
-                memcpy(C + (ii + i) * N + jj, C_blk + i * 32, 32 * sizeof(float));
+    /* 预分配 packing 缓冲 (一次, 全程复用) */
+    float *A_block = (float *)malloc(sizeof(float) * BLKM * BLKK);  /* 128×128 */
+    float *B_panel = (float *)malloc(sizeof(float) * BLKK * BLKN);  /* 128×128 */
+    float *C_blk   = (float *)malloc(sizeof(float) * SI * SJ);      /* 32×32 */
+
+    /* L1: j 循环 (blkn) */
+    for (int j = 0; j < N; j += BLKN) {
+        int blkn = (j + BLKN <= N) ? BLKN : (N - j);
+
+        /* L2: k 循环 (blkk) */
+        for (int k = 0; k < K; k += BLKK) {
+            int blkk = (k + BLKK <= K) ? BLKK : (K - k);
+
+            /* pack B[k:k+blkk, j:j+blkn] → B_panel
+             * 按 32 列子块组织, 每子块 row-major blkk×32 (行距 32) */
+            int n_blocks = (blkn + SJ - 1) / SJ;
+            for (int jb = 0; jb < n_blocks; jb++) {
+                int sj_cur = (jb * SJ + SJ <= blkn) ? SJ : (blkn - jb * SJ);
+                for (int kk = 0; kk < blkk; kk++)
+                    for (int jj = 0; jj < sj_cur; jj++)
+                        B_panel[(size_t)jb * BLKK * SJ + (size_t)kk * SJ + jj] =
+                            B[(size_t)(k + kk) * N + (j + jb * SJ + jj)];
+            }
+
+            /* L3: i 循环 (blkm) */
+            for (int i = 0; i < M; i += BLKM) {
+                int blkm = (i + BLKM <= M) ? BLKM : (M - i);
+
+                /* pack A[i:i+blkm, k:k+blkk] → A_block
+                 * 按 32 行子块组织, 每子块 col-major 32×blkk (列距 32) */
+                int m_blocks = (blkm + SI - 1) / SI;
+                for (int ib = 0; ib < m_blocks; ib++) {
+                    int si_cur = (ib * SI + SI <= blkm) ? SI : (blkm - ib * SI);
+                    for (int kk = 0; kk < blkk; kk++)
+                        for (int ii = 0; ii < si_cur; ii++)
+                            A_block[(size_t)ib * BLKK * SI + (size_t)kk * SI + ii] =
+                                A[(size_t)(i + ib * SI + ii) * K + (k + kk)];
+                }
+
+                /* L4: jj 循环 (sj=32) */
+                for (int jj = 0; jj < blkn; jj += SJ) {
+                    int sj_cur = (jj + SJ <= blkn) ? SJ : (blkn - jj);
+                    int jb = jj / SJ;
+
+                    /* L5: ii 循环 (si=32) = microkernel */
+                    for (int ii = 0; ii < blkm; ii += SI) {
+                        int si_cur = (ii + SI <= blkm) ? SI : (blkm - ii);
+                        int ib = ii / SI;
+
+                        /* pack C[i+ii:i+ii+si, j+jj:j+jj+sj] → C_blk (32×32 连续) */
+                        for (int r = 0; r < si_cur; r++)
+                            memcpy(C_blk + r * 32,
+                                   C + (size_t)(i + ii + r) * N + (j + jj),
+                                   sj_cur * sizeof(float));
+
+                        /* microkernel: C_blk += A_sub * B_sub (完整 C += A*B) */
+                        micro_32x32_kupdate(C_blk,
+                            A_block + (size_t)ib * BLKK * SI,
+                            B_panel + (size_t)jb * BLKK * SJ,
+                            blkk);
+
+                        /* unpack C_blk → 原 C */
+                        for (int r = 0; r < si_cur; r++)
+                            memcpy(C + (size_t)(i + ii + r) * N + (j + jj),
+                                   C_blk + r * 32,
+                                   sj_cur * sizeof(float));
+                    }
+                }
+            }
         }
     }
 
-    free(A_blk); free(B_blk); free(C_blk);
+    free(A_block); free(B_panel); free(C_blk);
 }
