@@ -111,10 +111,12 @@ static void probe_bandwidth(void) {
 
     /* warmup */
     memcpy(dst, src, bytes);
+    __asm__ volatile("" ::: "memory");  /* 阻止跨迭代消除 */
     int reps = 50;
     double t0 = now_sec();
     for (int r = 0; r < reps; r++) {
         memcpy(dst, src, bytes);
+        __asm__ volatile("" ::: "memory");  /* 关键: 阻止 -O3 把多次 memcpy 合并/消除 */
     }
     double dt = now_sec() - t0;
     /* memcpy = read + write, 总数据移动 = 2*bytes*reps */
