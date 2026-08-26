@@ -86,63 +86,62 @@ static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K)
  * tile 布局: za0=C[0:16,0:16] za1=C[0:16,16:32] za2=C[16:32,0:16] za3=C[16:32,16:32]
  */
 __attribute__((target("sve,sme")))
-static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K) {
-    float *Cl = C;             /* C 初值加载: 低 16 行起点 */
-    float *Ch = C + 16 * 32;   /* C 初值加载: 高 16 行起点 */
-    float *Cl2 = C;            /* 写回: 低 16 行起点 (独立指针) */
-    float *Ch2 = C + 16 * 32;  /* 写回: 高 16 行起点 */
-    const float *A1 = A + 16;  /* A 列后 16 行 (col-major: 第 k 列的行 16..31) */
-    const float *B1 = B + 16;  /* B 行后 16 列 (row-major: 第 k 行的列 16..31) */
-    /* 注意: SVE ld1w / ZA st1w 的立即 offset 是 scaled 索引, 范围仅 [-8,7]
-     * (字节偏移 [-32,28]), 不能用 #64. 全部用独立指针 + add 推进. */
+static void micro_32x32_kupdate(float *C, int ldC, const float *A, const float *B, int K) {
+    /* ldC: C 行距 (元素数, = N 在 MacroKernel 中)
+     * 直接在原 C 上操作, 避免 pack/unpack C 的 memcpy 开销 */
+    float *Cl = C;               /* C 初值加载: 低 16 行起点 */
+    float *Ch = C + 16 * (size_t)ldC;  /* C 初值加载: 高 16 行起点 */
+    float *Cl2 = C;              /* 写回: 低 16 行起点 */
+    float *Ch2 = C + 16 * (size_t)ldC;
+    const float *A1 = A + 16;    /* A 列后 16 行 */
+    const float *B1 = B + 16;    /* B 行后 16 列 */
+    long ldc_skip = (long)ldC * 4 - 64;  /* 行间跳距(字节): 行距*4 - 已加的64 */
+    /* 当 ldC=32 (连续 32×32): ldc_skip=64, 与原固定 #64 一致 */
     __asm__ volatile(
         "smstart sm\n\t"
         "smstart za\n\t"
         "ptrue p0.s, all\n\t"
-        /* 加载 C 初值进 4 个 tile (完整 C += A*B 语义, 代替 zero {za}) */
+        /* 加载 C 初值进 4 tile (行距 ldC, 用 ldc_skip 跳行) */
         "mov w12, #0\n\t"
         "3:\n\t"
         "ld1w {za0h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
         "add %[Cl], %[Cl], #64\n\t"
         "ld1w {za1h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
-        "add %[Cl], %[Cl], #64\n\t"
+        "add %[Cl], %[Cl], %[ls]\n\t"
         "ld1w {za2h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
         "add %[Ch], %[Ch], #64\n\t"
         "ld1w {za3h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
-        "add %[Ch], %[Ch], #64\n\t"
+        "add %[Ch], %[Ch], %[ls]\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 3b\n\t"
-        /* K 循环: 每步 2 条 A 向量 + 2 条 B 向量, 4 条 fmopa (2x2 tile 块) */
+        /* K 循环: 每步 2 A 向量 + 2 B 向量, 4 fmopa (2x2 tile 块) */
         "1:\n\t"
-        "ld1w z0.s, p0/z, [%[A]]\n\t"           /* A 列前 16 行 */
-        "ld1w z1.s, p0/z, [%[A1]]\n\t"          /* A 列后 16 行 */
-        "ld1w z2.s, p0/z, [%[B]]\n\t"           /* B 行前 16 列 */
-        "ld1w z3.s, p0/z, [%[B1]]\n\t"          /* B 行后 16 列 */
-        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s\n\t"   /* C[0:16, 0:16]  += z0 ⊗ z2 */
-        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s\n\t"   /* C[0:16,16:32]  += z0 ⊗ z3 */
-        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s\n\t"   /* C[16:32,0:16]  += z1 ⊗ z2 */
-        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s\n\t"   /* C[16:32,16:32] += z1 ⊗ z3 */
-        "add %[A],  %[A],  #128\n\t"            /* A 下一列 (32*4=128 字节) */
+        "ld1w z0.s, p0/z, [%[A]]\n\t"
+        "ld1w z1.s, p0/z, [%[A1]]\n\t"
+        "ld1w z2.s, p0/z, [%[B]]\n\t"
+        "ld1w z3.s, p0/z, [%[B1]]\n\t"
+        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s\n\t"
+        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s\n\t"
+        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s\n\t"
+        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s\n\t"
+        "add %[A],  %[A],  #128\n\t"
         "add %[A1], %[A1], #128\n\t"
-        "add %[B],  %[B],  #128\n\t"            /* B 下一行 */
+        "add %[B],  %[B],  #128\n\t"
         "add %[B1], %[B1], #128\n\t"
         "subs %w[K], %w[K], #1\n\t"
         "b.ne 1b\n\t"
-        /* 写回: 每迭代写 2 行 (行 i 与 行 i+16), 16 迭代覆盖 32 行
-         * 行 i:    za0 行 i → C[i][0:16],     za1 行 i → C[i][16:32]
-         * 行 i+16:  za2 行 i → C[i+16][0:16], za3 行 i → C[i+16][16:32]
-         * 行距 128 字节 = 2 段 64 字节, 用 add 推进 (st1w 无大立即偏移) */
+        /* 写回 (行距 ldC, 用 Cl2/Ch2 + ldc_skip) */
         "mov w12, #0\n\t"
         "2:\n\t"
         "st1w {za0h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
         "add %[Cl2], %[Cl2], #64\n\t"
         "st1w {za1h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
-        "add %[Cl2], %[Cl2], #64\n\t"
+        "add %[Cl2], %[Cl2], %[ls]\n\t"
         "st1w {za2h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
         "add %[Ch2], %[Ch2], #64\n\t"
         "st1w {za3h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
-        "add %[Ch2], %[Ch2], #64\n\t"
+        "add %[Ch2], %[Ch2], %[ls]\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 2b\n\t"
@@ -151,7 +150,7 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
         : [A] "+r" (A), [A1] "+r" (A1), [B] "+r" (B), [B1] "+r" (B1),
           [Cl] "+r" (Cl), [Ch] "+r" (Ch), [Cl2] "+r" (Cl2), [Ch2] "+r" (Ch2),
           [K] "+r" (K)
-        :
+        : [ls] "r" (ldc_skip)
         : "memory", "w12"
     );
 }
@@ -182,12 +181,10 @@ void kirby_sgemm_fp32(int M, int N, int K,
     }
 
     /* MacroKernel: 32×32 块遍历 (M, N 都是 32 倍数)
-     * 每块 pack A (转置 col-major) + pack B (跨 stride row-major) + pack/unpack C
-     * 性能: 当前每块 malloc/free + memcpy 开销大, 后续优化用预分配缓冲
-     * 正确性: pack 后调已验证的 micro_32x32, C 块连续 32×32 行距 32 */
+     * 每块 pack A (转置 col-major) + pack B (跨 stride row-major)
+     * C 直接在原矩阵操作 (行距 N), 无 pack/unpack C → 省掉 2×32 memcpy/块 */
     float *A_blk = (float *)malloc(sizeof(float) * 32 * (size_t)K);
     float *B_blk = (float *)malloc(sizeof(float) * (size_t)K * 32);
-    float *C_blk = (float *)malloc(sizeof(float) * 32 * 32);
 
     for (int ii = 0; ii < M; ii += 32) {
         for (int jj = 0; jj < N; jj += 32) {
@@ -199,18 +196,9 @@ void kirby_sgemm_fp32(int M, int N, int K,
             for (int k = 0; k < K; k++)
                 for (int j = 0; j < 32; j++)
                     B_blk[k * 32 + j] = B[k * N + (jj + j)];
-            /* pack C[ii:ii+32, jj:jj+32] → 连续 32×32 row-major (加载初值) */
-            for (int i = 0; i < 32; i++)
-                memcpy(C_blk + i * 32, C + (ii + i) * N + jj, 32 * sizeof(float));
-
-            /* microkernel: C_blk += A_blk * B_blk (完整 C += A*B) */
-            micro_32x32_kupdate(C_blk, A_blk, B_blk, K);
-
-            /* unpack C_blk → 原 C (覆盖, C_blk 已含 C_old + A*B) */
-            for (int i = 0; i < 32; i++)
-                memcpy(C + (ii + i) * N + jj, C_blk + i * 32, 32 * sizeof(float));
+            /* microkernel: 直接在原 C 上操作 (行距 N, 无 C pack/unpack) */
+            micro_32x32_kupdate(C + (size_t)ii * N + jj, N, A_blk, B_blk, K);
         }
     }
-
-    free(A_blk); free(B_blk); free(C_blk);
+    free(A_blk); free(B_blk);
 }
