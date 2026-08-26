@@ -78,8 +78,12 @@ static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K)
  */
 __attribute__((target("sve,sme")))
 static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K) {
-    float *Cl = C;            /* 低 16 行起点 (行 0) */
-    float *Ch = C + 16 * 32;  /* 高 16 行起点 (行 16) */
+    float *Cl = C;             /* 低 16 行起点 (行 0) */
+    float *Ch = C + 16 * 32;   /* 高 16 行起点 (行 16) */
+    const float *A1 = A + 16;  /* A 列后 16 行 (col-major: 第 k 列的行 16..31) */
+    const float *B1 = B + 16;  /* B 行后 16 列 (row-major: 第 k 行的列 16..31) */
+    /* 注意: SVE ld1w / ZA st1w 的立即 offset 是 scaled 索引, 范围仅 [-8,7]
+     * (字节偏移 [-32,28]), 不能用 #64. 全部用独立指针 + add 推进. */
     __asm__ volatile(
         "smstart sm\n\t"
         "smstart za\n\t"
@@ -87,35 +91,41 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
         "ptrue p0.s, all\n\t"
         /* K 循环: 每步 2 条 A 向量 + 2 条 B 向量, 4 条 fmopa (2x2 tile 块) */
         "1:\n\t"
-        "ld1w z0.s, p0/z, [%[A]]\n\t"          /* A 列前 16 行 */
-        "ld1w z1.s, p0/z, [%[A], #64]\n\t"     /* A 列后 16 行 */
-        "ld1w z2.s, p0/z, [%[B]]\n\t"          /* B 行前 16 列 */
-        "ld1w z3.s, p0/z, [%[B], #64]\n\t"     /* B 行后 16 列 */
+        "ld1w z0.s, p0/z, [%[A]]\n\t"           /* A 列前 16 行 */
+        "ld1w z1.s, p0/z, [%[A1]]\n\t"          /* A 列后 16 行 */
+        "ld1w z2.s, p0/z, [%[B]]\n\t"           /* B 行前 16 列 */
+        "ld1w z3.s, p0/z, [%[B1]]\n\t"          /* B 行后 16 列 */
         "fmopa za0.s, p0/m, p0/m, z0.s, z2.s\n\t"   /* C[0:16, 0:16]  += z0 ⊗ z2 */
         "fmopa za1.s, p0/m, p0/m, z0.s, z3.s\n\t"   /* C[0:16,16:32]  += z0 ⊗ z3 */
         "fmopa za2.s, p0/m, p0/m, z1.s, z2.s\n\t"   /* C[16:32,0:16]  += z1 ⊗ z2 */
         "fmopa za3.s, p0/m, p0/m, z1.s, z3.s\n\t"   /* C[16:32,16:32] += z1 ⊗ z3 */
-        "add %[A], %[A], #128\n\t"             /* A 下一列 (32*4=128 字节) */
-        "add %[B], %[B], #128\n\t"             /* B 下一行 */
+        "add %[A],  %[A],  #128\n\t"            /* A 下一列 (32*4=128 字节) */
+        "add %[A1], %[A1], #128\n\t"
+        "add %[B],  %[B],  #128\n\t"            /* B 下一行 */
+        "add %[B1], %[B1], #128\n\t"
         "subs %w[K], %w[K], #1\n\t"
         "b.ne 1b\n\t"
         /* 写回: 每迭代写 2 行 (行 i 与 行 i+16), 16 迭代覆盖 32 行
          * 行 i:    za0 行 i → C[i][0:16],     za1 行 i → C[i][16:32]
-         * 行 i+16:  za2 行 i → C[i+16][0:16], za3 行 i → C[i+16][16:32] */
+         * 行 i+16:  za2 行 i → C[i+16][0:16], za3 行 i → C[i+16][16:32]
+         * 行距 128 字节 = 2 段 64 字节, 用 add 推进 (st1w 无大立即偏移) */
         "mov w12, #0\n\t"
         "2:\n\t"
         "st1w {za0h.s[w12, 0]}, p0, [%[Cl]]\n\t"
-        "st1w {za1h.s[w12, 0]}, p0, [%[Cl], #64]\n\t"
-        "add %[Cl], %[Cl], #128\n\t"           /* C 行距 32*4=128 字节 */
+        "add %[Cl], %[Cl], #64\n\t"
+        "st1w {za1h.s[w12, 0]}, p0, [%[Cl]]\n\t"
+        "add %[Cl], %[Cl], #64\n\t"
         "st1w {za2h.s[w12, 0]}, p0, [%[Ch]]\n\t"
-        "st1w {za3h.s[w12, 0]}, p0, [%[Ch], #64]\n\t"
-        "add %[Ch], %[Ch], #128\n\t"
+        "add %[Ch], %[Ch], #64\n\t"
+        "st1w {za3h.s[w12, 0]}, p0, [%[Ch]]\n\t"
+        "add %[Ch], %[Ch], #64\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 2b\n\t"
         "smstop za\n\t"
         "smstop sm\n\t"
-        : [A] "+r" (A), [B] "+r" (B), [Cl] "+r" (Cl), [Ch] "+r" (Ch), [K] "+r" (K)
+        : [A] "+r" (A), [A1] "+r" (A1), [B] "+r" (B), [B1] "+r" (B1),
+          [Cl] "+r" (Cl), [Ch] "+r" (Ch), [K] "+r" (K)
         :
         : "memory", "w12"
     );
