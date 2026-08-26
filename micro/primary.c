@@ -85,8 +85,8 @@ static void za_transpose_16x16(float *dst, int dst_stride,
                                 const float *src, int src_stride) {
     float *s = (float *)src;
     float *d = dst;
-    long src_skip = (long)(src_stride - 16) * 4;  /* 行间跳距: src 下一行 */
-    long dst_skip = (long)(dst_stride - 16) * 4;  /* 列间跳距: dst 下一列 */
+    long src_skip = (long)src_stride * 4;  /* 行间跳距: 跳整行 (ld1w 不推进指针) */
+    long dst_skip = (long)dst_stride * 4;  /* 列间跳距: 跳整列 (st1w 不推进指针) */
     __asm__ volatile(
         "smstart sm\n\t"
         "smstart za\n\t"
