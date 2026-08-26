@@ -156,33 +156,61 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
     );
 }
 
-/* KirbyMM GEMM 入口 (当前简化版, 阶段一)
- * M=N=16 或 M=N=32 时走 SME microkernel, 其他规模 fallback naive
- * C += A*B 语义 (但当前 microkernel 覆盖式, 假设 C 初始 0)
+/* KirbyMM GEMM 入口 (阶段一: MacroKernel 32×32 块遍历)
+ * M=N=16: 走 16×16 单瓦片 SME
+ * M,N 都是 32 倍数: 32×32 块遍历, 每块走 SME (pack A/B/C)
+ * 其他 (含边界): fallback naive
+ * 完整 C += A*B 语义 (microkernel 加载 C 初值进 ZA, 累加后写回)
  */
 void kirby_sgemm_fp32(int M, int N, int K,
                       const float *A, const float *B, float *C) {
-    if ((M != 16 && M != 32) || N != M) {
-        /* 非 16/32 规模暂用 naive 兜底, 后续接 MacroKernel 分块 */
+    /* M=N=16 单块 SME 路径 (保留作小规模验证) */
+    if (M == 16 && N == 16) {
+        float *A_col = (float *)malloc(sizeof(float) * 16 * (size_t)K);
+        for (int k = 0; k < K; k++)
+            for (int i = 0; i < 16; i++)
+                A_col[k * 16 + i] = A[i * K + k];
+        micro_16x16_kupdate(C, A_col, B, K);
+        free(A_col);
+        return;
+    }
+
+    /* 非 32 倍数 (含边界) → naive 兜底 */
+    if (M % 32 != 0 || N % 32 != 0) {
         naive_sgemm_fp32(M, N, K, A, B, C);
         return;
     }
 
-    /* A: row-major MxK → col-major MxK (转置, 每列连续) */
-    float *A_col = (float *)malloc(sizeof(float) * (size_t)M * (size_t)K);
-    for (int k = 0; k < K; k++) {
-        for (int i = 0; i < M; i++) {
-            A_col[k * M + i] = A[i * K + k];   /* A_col[k][i] = A[i][k] */
+    /* MacroKernel: 32×32 块遍历 (M, N 都是 32 倍数)
+     * 每块 pack A (转置 col-major) + pack B (跨 stride row-major) + pack/unpack C
+     * 性能: 当前每块 malloc/free + memcpy 开销大, 后续优化用预分配缓冲
+     * 正确性: pack 后调已验证的 micro_32x32, C 块连续 32×32 行距 32 */
+    float *A_blk = (float *)malloc(sizeof(float) * 32 * (size_t)K);
+    float *B_blk = (float *)malloc(sizeof(float) * (size_t)K * 32);
+    float *C_blk = (float *)malloc(sizeof(float) * 32 * 32);
+
+    for (int ii = 0; ii < M; ii += 32) {
+        for (int jj = 0; jj < N; jj += 32) {
+            /* pack A[ii:ii+32, :] → col-major 32×K (转置, 每列连续 32 FP32) */
+            for (int k = 0; k < K; k++)
+                for (int i = 0; i < 32; i++)
+                    A_blk[k * 32 + i] = A[(ii + i) * K + k];
+            /* pack B[:, jj:jj+32] → row-major K×32 (跨 stride 复制, 每行连续 32) */
+            for (int k = 0; k < K; k++)
+                for (int j = 0; j < 32; j++)
+                    B_blk[k * 32 + j] = B[k * N + (jj + j)];
+            /* pack C[ii:ii+32, jj:jj+32] → 连续 32×32 row-major (加载初值) */
+            for (int i = 0; i < 32; i++)
+                memcpy(C_blk + i * 32, C + (ii + i) * N + jj, 32 * sizeof(float));
+
+            /* microkernel: C_blk += A_blk * B_blk (完整 C += A*B) */
+            micro_32x32_kupdate(C_blk, A_blk, B_blk, K);
+
+            /* unpack C_blk → 原 C (覆盖, C_blk 已含 C_old + A*B) */
+            for (int i = 0; i < 32; i++)
+                memcpy(C + (ii + i) * N + jj, C_blk + i * 32, 32 * sizeof(float));
         }
     }
 
-    /* B: row-major KxM 已符合 microkernel 约定 (每行连续), 无需转换 */
-
-    if (M == 16) {
-        micro_16x16_kupdate(C, A_col, B, K);
-    } else {
-        micro_32x32_kupdate(C, A_col, B, K);
-    }
-
-    free(A_col);
+    free(A_blk); free(B_blk); free(C_blk);
 }
