@@ -85,19 +85,21 @@ static int run_case(int M, int N, int K,
 int main(void) {
     printf("=== KirbyMM correctness verification ===\n\n");
 
-    /* ref = naive, test = kirby (M=16 走 SME, 其他 fallback naive 自对照) */
+    /* ref = naive, test = kirby (M=16/32 走 SME, 其他 fallback naive 自对照) */
     gemm_fn_t ref  = naive_sgemm_fp32;
     gemm_fn_t test = kirby_sgemm_fp32;
 
     /* 测试用例集 */
     struct { int M, N, K; const char *note; } cases[] = {
-        { 16,  16,  16, "kirby 16x16"   },  /* SME 路径 */
-        { 16,  16,  32, "kirby 16x16x32" },  /* SME, K>16 */
-        { 16,  16,  64, "kirby 16x16x64" },  /* SME, K=64 */
-        { 64,  64,  64, "fallback naive" },
-        {128, 128, 128, "fallback naive" },
-        { 35,  32,  32, "edge fallback"  },
-        {1024,1024,1024, "large"       },
+        { 16,  16,  16, "kirby 16x16"     },  /* SME 单瓦片 */
+        { 16,  16,  64, "kirby 16x16x64"  },  /* SME, K=64 */
+        { 32,  32,  32, "kirby 32x32"     },  /* SME 4瓦片 2x2 (论文主例程) */
+        { 32,  32,  64, "kirby 32x32x64"  },  /* SME, K=64 */
+        { 32,  32, 128, "kirby 32x32x128" },  /* SME, K=128 */
+        { 64,  64,  64, "fallback naive"  },
+        {128, 128, 128, "fallback naive"  },
+        { 35,  32,  32, "edge fallback"   },
+        {1024,1024,1024, "large"          },
     };
     int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
 
