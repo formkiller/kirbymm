@@ -99,35 +99,50 @@ static void probe_stride_latency(void) {
     printf("\n(注: 真实 L1/L2 边界应以 sysctl 容量为准, 此探测仅供交叉参考)\n\n");
 }
 
-/* 带宽探测: memcpy 测 B_max (不能被优化掉, OS 高度优化)
- * memcpy = 1 read + 1 write, 纯读带宽 ≈ 总带宽的一半 */
+/* noinline 读归约函数: 阻止 -O3 跨函数优化消除读取
+ * 编译器不能跨 noinline 边界分析, 必须真正读 buf
+ * 内部仍可向量化 (测真实带宽, 非标量下限) */
+__attribute__((noinline))
+static uint64_t read_reduce(const uint64_t *buf, size_t count) {
+    uint64_t acc = 0;
+    for (size_t i = 0; i < count; i++) {
+        acc += buf[i];
+    }
+    return acc;
+}
+
+/* 带宽探测: 调用 noinline 读函数, 测真实内存带宽 */
 static void probe_bandwidth(void) {
     printf("--- memory bandwidth probe (B_max for Eq.5) ---\n");
-    size_t bytes = 64 * 1024 * 1024;  /* 64MB, 远超 L2, 测真实内存带宽 */
-    uint8_t *src = (uint8_t *)malloc(bytes);
-    uint8_t *dst = (uint8_t *)malloc(bytes);
-    if (!src || !dst) { printf("alloc failed\n"); return; }
-    memset(src, 0xAB, bytes);
+    size_t bytes = 64 * 1024 * 1024;  /* 64MB, 远超 L2 */
+    size_t count = bytes / sizeof(uint64_t);
+    uint64_t *buf = (uint64_t *)malloc(bytes);
+    if (!buf) { printf("alloc failed\n"); return; }
+
+    /* 填充非零, 避免零页优化 */
+    for (size_t i = 0; i < count; i++) buf[i] = i * 7 + 1;
+
+    int reps = 20;
+    uint64_t checksum = 0;
 
     /* warmup */
-    memcpy(dst, src, bytes);
-    __asm__ volatile("" ::: "memory");  /* 阻止跨迭代消除 */
-    int reps = 50;
+    checksum ^= read_reduce(buf, count);
+
     double t0 = now_sec();
     for (int r = 0; r < reps; r++) {
-        memcpy(dst, src, bytes);
-        __asm__ volatile("" ::: "memory");  /* 关键: 阻止 -O3 把多次 memcpy 合并/消除 */
+        checksum ^= read_reduce(buf, count);  /* noinline, 必须真正读 */
     }
     double dt = now_sec() - t0;
-    /* memcpy = read + write, 总数据移动 = 2*bytes*reps */
-    double total_gbs = (double)bytes * 2.0 * reps / dt / 1e9;
-    double read_gbs = (double)bytes * reps / dt / 1e9;  /* 纯读估计 */
 
-    printf("memcpy 64MB x%d: total %.2f GB/s (read+write)\n", reps, total_gbs);
-    printf("B_max (read est) ≈ %.2f GB/s\n\n", read_gbs);
+    /* 输出 checksum, 阻止整体消除 */
+    printf("(checksum: %lu, reps=%d)\n", (unsigned long)checksum, reps);
+
+    double gbs = (double)bytes * reps / dt / 1e9;
+    printf("64MB stream read x%d: %.2f GB/s\n", reps, gbs);
+    printf("B_max ≈ %.2f GB/s\n\n", gbs);
     printf("代入 Eq.5: I_max = P_peak / B_max = 512 / %.2f = %.2f FLOP/byte\n",
-           read_gbs, 512.0 / read_gbs);
-    free(src); free(dst);
+           gbs, 512.0 / gbs);
+    free(buf);
 }
 
 /* 相联度假设 (Apple 不暴露, 用典型值, 待 conflict 探测验证) */
