@@ -33,6 +33,9 @@ add_executable(svl_probe tools/svl_probe.c)
 # ---- fmopa 计算正确性 + ZA slice read 语法验证 ----
 add_executable(fmopa_sanity tools/fmopa_sanity.c)
 
+# ---- M4 缓存几何探测 (§V-A 内存敏感分块前置) ----
+add_executable(cache_probe tools/cache_probe.c)
+
 # ---- 正确性验证 (ref=naive, test=kirby) ----
 add_executable(verify test/verify.c)
 target_link_libraries(verify PRIVATE kirbymm m)
