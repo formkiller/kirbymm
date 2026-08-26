@@ -115,7 +115,8 @@ static void micro_32x32_kupdate(float *C, int ldC, const float *A, const float *
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 3b\n\t"
-        /* K 循环: 每步 2 A 向量 + 2 B 向量, 4 fmopa (2x2 tile 块) */
+        /* K 循环: 展开 2 步 (减半 branch + 增大 ILP 窗口)
+         * 中间 b.eq 处理奇数 K 尾部 (步骤1后若 K=0 则跳出) */
         "1:\n\t"
         "ld1w z0.s, p0/z, [%[A]]\n\t"
         "ld1w z1.s, p0/z, [%[A1]]\n\t"
@@ -130,7 +131,22 @@ static void micro_32x32_kupdate(float *C, int ldC, const float *A, const float *
         "add %[B],  %[B],  #128\n\t"
         "add %[B1], %[B1], #128\n\t"
         "subs %w[K], %w[K], #1\n\t"
+        "b.eq 4f\n\t"
+        "ld1w z0.s, p0/z, [%[A]]\n\t"
+        "ld1w z1.s, p0/z, [%[A1]]\n\t"
+        "ld1w z2.s, p0/z, [%[B]]\n\t"
+        "ld1w z3.s, p0/z, [%[B1]]\n\t"
+        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s\n\t"
+        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s\n\t"
+        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s\n\t"
+        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s\n\t"
+        "add %[A],  %[A],  #128\n\t"
+        "add %[A1], %[A1], #128\n\t"
+        "add %[B],  %[B],  #128\n\t"
+        "add %[B1], %[B1], #128\n\t"
+        "subs %w[K], %w[K], #1\n\t"
         "b.ne 1b\n\t"
+        "4:\n\t"
         /* 写回 (行距 ldC, 用 Cl2/Ch2 + ldc_skip) */
         "mov w12, #0\n\t"
         "2:\n\t"
