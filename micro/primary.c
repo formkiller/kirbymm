@@ -45,23 +45,23 @@ static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K)
         "ptrue p0.s, all\n\t"
         /* K 循环: 每步加载 A 一列 + B 一行, fmopa 累加进 za0 */
         "1:\n\t"
-        "ld1w z0.s, p0/z, [%[A]]\n\t"           /* A 列前 16 FP32 */
+        "ld1w z0.s, p0/z, [%[A]]\n\t"           /* A 列 16 FP32 */
         "ld1w z1.s, p0/z, [%[B]]\n\t"           /* B 行 16 FP32 */
         "fmopa za0.s, p0/m, p0/m, z0.s, z1.s\n\t"
         "add %[A], %[A], #64\n\t"              /* A 下一列 (16*4=64 字节) */
         "add %[B], %[B], #64\n\t"              /* B 下一行 */
-        "subs %[K], %[K], #1\n\t"
+        "subs %w[K], %w[K], #1\n\t"             /* K-- (w 寄存器, 32-bit) */
         "b.ne 1b\n\t"
-        /* 写回: za0 的 16 行 (水平 slice 0..15) 存到 C (row-major, 每行 64 字节) */
-        "mov w12, #0\n\t"                       /* tile 偏移 = 0 (za0) */
-#define ST_ROW(N) \
-        "st1w {za0h.s[w12, " #N "]}, p0, [%[C]]\n\t" \
-        "add %[C], %[C], #64\n\t"
-        ST_ROW(0)  ST_ROW(1)  ST_ROW(2)  ST_ROW(3)
-        ST_ROW(4)  ST_ROW(5)  ST_ROW(6)  ST_ROW(7)
-        ST_ROW(8)  ST_ROW(9)  ST_ROW(10) ST_ROW(11)
-        ST_ROW(12) ST_ROW(13) ST_ROW(14) ST_ROW(15)
-#undef ST_ROW
+        /* 写回: za0 的 16 行存到 C (row-major, 每行 64 字节)
+         * ZA slice 语义: 行号 = w12 + imm, imm ∈ [0,3] (2-bit 编码)
+         * 故用循环: w12 递增 0..15, imm 恒 0 */
+        "mov w12, #0\n\t"                       /* 行号 = 0 */
+        "2:\n\t"
+        "st1w {za0h.s[w12, 0]}, p0, [%[C]]\n\t"
+        "add %[C], %[C], #64\n\t"              /* C 下一行 */
+        "add w12, w12, #1\n\t"                 /* 行号++ */
+        "cmp w12, #16\n\t"
+        "b.ne 2b\n\t"
         "smstop za\n\t"
         "smstop sm\n\t"
         : [A] "+r" (A), [B] "+r" (B), [C] "+r" (C), [K] "+r" (K)
