@@ -189,12 +189,12 @@ void kirby_sgemm_fp32(int M, int N, int K,
     for (int ii = 0; ii < M; ii += 32) {
         for (int jj = 0; jj < N; jj += 32) {
             /* pack A[ii:ii+32, :] → col-major 32×K
-             * 分块转置: 32×32 子块 (4KB 装入 L1), 减少 A 跨行 stride K 的 cache miss
-             * 子块内 A 行内连续读 (32 元素), A_blk 子块内跨行 stride 32 (L1 命中) */
+             * 分块转置: 32×32 子块 (4KB 装入 L1)
+             * 子块内 i 外 k 内: A 行内连续读 (cache 友好), A_blk 跨行 stride 32 (L1 命中) */
             for (int kk = 0; kk < K; kk += 32) {
                 int blkk = (kk + 32 <= K) ? 32 : (K - kk);
-                for (int k = 0; k < blkk; k++) {
-                    for (int i = 0; i < 32; i++) {
+                for (int i = 0; i < 32; i++) {
+                    for (int k = 0; k < blkk; k++) {
                         A_blk[(kk + k) * 32 + i] = A[(ii + i) * K + (kk + k)];
                     }
                 }
