@@ -115,6 +115,127 @@ static void za_transpose_16x16(float *dst, int dst_stride,
     );
 }
 
+/* 专用例程 microkernel (论文 §IV-B, Fig.8: M=35 直接复现)
+ * M=35: 主体 32×32 走 4 fmopa (za0-za3), 边缘 3 行走 6 fmla (z10-z15)
+ * C: 35×32 row-major (行距 32 = 128 字节)
+ * A: col-major 35×K (每列 35 FP32 连续, 列距 35)
+ * B: row-major K×32 (每行 32 FP32 连续)
+ *
+ * K 循环每步 (论文 Fig.8(b)):
+ *   4 fmopa (主体 32×32) + 3×2 fmla (边缘 3×32, A 标量广播 × B 向量)
+ *   M4 上 fmopa/fmla 共享 SME 单元不 overlap, 但代码结构与论文一致
+ *   LX2 上 overlap 使 T_{4mopa+6mla} = T_{4mopa} (Eq.4)
+ */
+__attribute__((target("sve,sme")))
+static void micro_dedicated_35x32(float *C, const float *A, const float *B, int K) {
+    float *Cl = C;               /* C 主体低 16 行 */
+    float *Ch = C + 16 * 32;     /* C 主体高 16 行 */
+    float *Cl2 = C;              /* 写回低 16 行 */
+    float *Ch2 = C + 16 * 32;    /* 写回高 16 行 */
+    float *Ce = C + 32 * 32;     /* C 边缘 3 行起点 */
+    float *Ce2 = Ce;             /* 写回边缘 */
+    const float *A1 = A + 16;     /* A 列行 16-31 */
+    const float *A_rem = A + 32; /* A 列行 32-34 (边缘 3 标量) */
+    const float *B1 = B + 16;    /* B 行后 16 列 */
+    __asm__ volatile(
+        "smstart sm\n\t"
+        "smstart za\n\t"
+        "ptrue p0.s, all\n\t"
+        /* 加载 C 初值: za0-za3 (主体 32×32) + z10-z15 (边缘 3×32) */
+        "mov w12, #0\n\t"
+        "3:\n\t"
+        "ld1w {za0h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
+        "add %[Cl], %[Cl], #64\n\t"
+        "ld1w {za1h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
+        "add %[Cl], %[Cl], #64\n\t"
+        "ld1w {za2h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
+        "add %[Ch], %[Ch], #64\n\t"
+        "ld1w {za3h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
+        "add %[Ch], %[Ch], #64\n\t"
+        "add w12, w12, #1\n\t"
+        "cmp w12, #16\n\t"
+        "b.ne 3b\n\t"
+        /* 加载边缘 C 初值 (3 行 × 2 向量 = 6 次 ld1w) */
+        "ld1w z10.s, p0/z, [%[Ce]]\n\t"
+        "add %[Ce], %[Ce], #64\n\t"
+        "ld1w z11.s, p0/z, [%[Ce]]\n\t"
+        "add %[Ce], %[Ce], #64\n\t"     /* Ce 跳到行 33 */
+        "ld1w z12.s, p0/z, [%[Ce]]\n\t"
+        "add %[Ce], %[Ce], #64\n\t"
+        "ld1w z13.s, p0/z, [%[Ce]]\n\t"
+        "add %[Ce], %[Ce], #64\n\t"     /* Ce 跳到行 34 */
+        "ld1w z14.s, p0/z, [%[Ce]]\n\t"
+        "add %[Ce], %[Ce], #64\n\t"
+        "ld1w z15.s, p0/z, [%[Ce]]\n\t"
+        /* K 循环: 4 fmopa (主体) + 6 fmla (边缘, 3 标量 × 2 B 向量) */
+        "1:\n\t"
+        "ld1w z0.s, p0/z, [%[A]]\n\t"          /* A 列行 0-15 */
+        "ld1w z1.s, p0/z, [%[A1]]\n\t"         /* A 列行 16-31 */
+        "ld1w z2.s, p0/z, [%[B]]\n\t"          /* B 行前 16 列 */
+        "ld1w z3.s, p0/z, [%[B1]]\n\t"         /* B 行后 16 列 */
+        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s\n\t"
+        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s\n\t"
+        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s\n\t"
+        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s\n\t"
+        /* 边缘: A 标量 (行 32/33/34) 广播 × B 向量, fmla 累加进 z10-z15 */
+        "ldr w0, [%[Ar]]\n\t"                  /* A[32, k] */
+        "dup z4.s, w0\n\t"
+        "fmla z10.s, p0/m, z4.s, z2.s\n\t"    /* C[32, 0:16] += A[32] ⊗ B[0:16] */
+        "fmla z11.s, p0/m, z4.s, z3.s\n\t"    /* C[32,16:32] */
+        "ldr w0, [%[Ar], #4]\n\t"              /* A[33, k] */
+        "dup z5.s, w0\n\t"
+        "fmla z12.s, p0/m, z5.s, z2.s\n\t"     /* C[33, 0:16] */
+        "fmla z13.s, p0/m, z5.s, z3.s\n\t"     /* C[33,16:32] */
+        "ldr w0, [%[Ar], #8]\n\t"              /* A[34, k] */
+        "dup z6.s, w0\n\t"
+        "fmla z14.s, p0/m, z6.s, z2.s\n\t"     /* C[34, 0:16] */
+        "fmla z15.s, p0/m, z6.s, z3.s\n\t"     /* C[34,16:32] */
+        /* 指针推进: A 列距=35 (35*4=140), B 行距=32 (128) */
+        "add %[A],  %[A],  #140\n\t"
+        "add %[A1], %[A1], #140\n\t"
+        "add %[Ar], %[Ar], #140\n\t"
+        "add %[B],  %[B],  #128\n\t"
+        "add %[B1], %[B1], #128\n\t"
+        "subs %w[K], %w[K], #1\n\t"
+        "b.ne 1b\n\t"
+        /* 写回主体 za0-za3 (32×32, 与 micro_32x32 相同) */
+        "mov w12, #0\n\t"
+        "2:\n\t"
+        "st1w {za0h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
+        "add %[Cl2], %[Cl2], #64\n\t"
+        "st1w {za1h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
+        "add %[Cl2], %[Cl2], #64\n\t"
+        "st1w {za2h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
+        "add %[Ch2], %[Ch2], #64\n\t"
+        "st1w {za3h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
+        "add %[Ch2], %[Ch2], #64\n\t"
+        "add w12, w12, #1\n\t"
+        "cmp w12, #16\n\t"
+        "b.ne 2b\n\t"
+        /* 写回边缘 z10-z15 (3×32, 6 次 st1w) */
+        "st1w z10.s, p0, [%[Ce2]]\n\t"
+        "add %[Ce2], %[Ce2], #64\n\t"
+        "st1w z11.s, p0, [%[Ce2]]\n\t"
+        "add %[Ce2], %[Ce2], #64\n\t"
+        "st1w z12.s, p0, [%[Ce2]]\n\t"
+        "add %[Ce2], %[Ce2], #64\n\t"
+        "st1w z13.s, p0, [%[Ce2]]\n\t"
+        "add %[Ce2], %[Ce2], #64\n\t"
+        "st1w z14.s, p0, [%[Ce2]]\n\t"
+        "add %[Ce2], %[Ce2], #64\n\t"
+        "st1w z15.s, p0, [%[Ce2]]\n\t"
+        "smstop za\n\t"
+        "smstop sm\n\t"
+        : [A] "+r" (A), [A1] "+r" (A1), [Ar] "+r" (A_rem),
+          [B] "+r" (B), [B1] "+r" (B1),
+          [Cl] "+r" (Cl), [Ch] "+r" (Ch), [Cl2] "+r" (Cl2), [Ch2] "+r" (Ch2),
+          [Ce] "+r" (Ce), [Ce2] "+r" (Ce2), [K] "+r" (K)
+        :
+        : "memory", "w12", "w0", "z0", "z1", "z2", "z3",
+          "z4", "z5", "z6", "z10", "z11", "z12", "z13", "z14", "z15"
+    );
+}
+
 /* 32×32 主例程 microkernel (论文 §IV-A, Fig.7 严格复现)
  * C: 32×32 row-major (行距 32 = 128 字节, 连续块)
  * A: col-major 32 × K (每列 32 FP32 连续)
@@ -216,6 +337,17 @@ void kirby_sgemm_fp32(int M, int N, int K,
             for (int i = 0; i < 16; i++)
                 A_col[k * 16 + i] = A[i * K + k];
         micro_16x16_kupdate(C, A_col, B, K);
+        free(A_col);
+        return;
+    }
+
+    /* M=35, N=32: 走专用例程 (§IV-B, Fig.8 的 fmopa+fmla 混合) */
+    if (M == 35 && N == 32) {
+        float *A_col = (float *)malloc(sizeof(float) * 35 * (size_t)K);
+        for (int k = 0; k < K; k++)
+            for (int i = 0; i < 35; i++)
+                A_col[k * 35 + i] = A[i * K + k];
+        micro_dedicated_35x32(C, A_col, B, K);
         free(A_col);
         return;
     }
