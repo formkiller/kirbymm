@@ -38,11 +38,20 @@
  */
 __attribute__((target("sve,sme")))
 static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K) {
+    float *Cl = C;   /* C 初值加载用指针 (推到末尾) */
+    float *Cw = C;   /* 写回用指针 (独立, 不受加载推进影响) */
     __asm__ volatile(
         "smstart sm\n\t"
         "smstart za\n\t"
-        "zero {za}\n\t"
         "ptrue p0.s, all\n\t"
+        /* 加载 C 初值进 za0 (完整 C += A*B 语义, 代替 zero {za}) */
+        "mov w12, #0\n\t"
+        "3:\n\t"
+        "ld1w {za0h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
+        "add %[Cl], %[Cl], #64\n\t"
+        "add w12, w12, #1\n\t"
+        "cmp w12, #16\n\t"
+        "b.ne 3b\n\t"
         /* K 循环: 每步加载 A 一列 + B 一行, fmopa 累加进 za0 */
         "1:\n\t"
         "ld1w z0.s, p0/z, [%[A]]\n\t"           /* A 列 16 FP32 */
@@ -57,14 +66,14 @@ static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K)
          * 故用循环: w12 递增 0..15, imm 恒 0 */
         "mov w12, #0\n\t"                       /* 行号 = 0 */
         "2:\n\t"
-        "st1w {za0h.s[w12, 0]}, p0, [%[C]]\n\t"
-        "add %[C], %[C], #64\n\t"              /* C 下一行 */
+        "st1w {za0h.s[w12, 0]}, p0, [%[Cw]]\n\t"
+        "add %[Cw], %[Cw], #64\n\t"            /* C 下一行 */
         "add w12, w12, #1\n\t"                 /* 行号++ */
         "cmp w12, #16\n\t"
         "b.ne 2b\n\t"
         "smstop za\n\t"
         "smstop sm\n\t"
-        : [A] "+r" (A), [B] "+r" (B), [C] "+r" (C), [K] "+r" (K)
+        : [A] "+r" (A), [B] "+r" (B), [Cl] "+r" (Cl), [Cw] "+r" (Cw), [K] "+r" (K)
         :
         : "memory", "w12"
     );
@@ -78,8 +87,10 @@ static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K)
  */
 __attribute__((target("sve,sme")))
 static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K) {
-    float *Cl = C;             /* 低 16 行起点 (行 0) */
-    float *Ch = C + 16 * 32;   /* 高 16 行起点 (行 16) */
+    float *Cl = C;             /* C 初值加载: 低 16 行起点 */
+    float *Ch = C + 16 * 32;   /* C 初值加载: 高 16 行起点 */
+    float *Cl2 = C;            /* 写回: 低 16 行起点 (独立指针) */
+    float *Ch2 = C + 16 * 32;  /* 写回: 高 16 行起点 */
     const float *A1 = A + 16;  /* A 列后 16 行 (col-major: 第 k 列的行 16..31) */
     const float *B1 = B + 16;  /* B 行后 16 列 (row-major: 第 k 行的列 16..31) */
     /* 注意: SVE ld1w / ZA st1w 的立即 offset 是 scaled 索引, 范围仅 [-8,7]
@@ -87,8 +98,21 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
     __asm__ volatile(
         "smstart sm\n\t"
         "smstart za\n\t"
-        "zero {za}\n\t"
         "ptrue p0.s, all\n\t"
+        /* 加载 C 初值进 4 个 tile (完整 C += A*B 语义, 代替 zero {za}) */
+        "mov w12, #0\n\t"
+        "3:\n\t"
+        "ld1w {za0h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
+        "add %[Cl], %[Cl], #64\n\t"
+        "ld1w {za1h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
+        "add %[Cl], %[Cl], #64\n\t"
+        "ld1w {za2h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
+        "add %[Ch], %[Ch], #64\n\t"
+        "ld1w {za3h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
+        "add %[Ch], %[Ch], #64\n\t"
+        "add w12, w12, #1\n\t"
+        "cmp w12, #16\n\t"
+        "b.ne 3b\n\t"
         /* K 循环: 每步 2 条 A 向量 + 2 条 B 向量, 4 条 fmopa (2x2 tile 块) */
         "1:\n\t"
         "ld1w z0.s, p0/z, [%[A]]\n\t"           /* A 列前 16 行 */
@@ -111,21 +135,22 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
          * 行距 128 字节 = 2 段 64 字节, 用 add 推进 (st1w 无大立即偏移) */
         "mov w12, #0\n\t"
         "2:\n\t"
-        "st1w {za0h.s[w12, 0]}, p0, [%[Cl]]\n\t"
-        "add %[Cl], %[Cl], #64\n\t"
-        "st1w {za1h.s[w12, 0]}, p0, [%[Cl]]\n\t"
-        "add %[Cl], %[Cl], #64\n\t"
-        "st1w {za2h.s[w12, 0]}, p0, [%[Ch]]\n\t"
-        "add %[Ch], %[Ch], #64\n\t"
-        "st1w {za3h.s[w12, 0]}, p0, [%[Ch]]\n\t"
-        "add %[Ch], %[Ch], #64\n\t"
+        "st1w {za0h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
+        "add %[Cl2], %[Cl2], #64\n\t"
+        "st1w {za1h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
+        "add %[Cl2], %[Cl2], #64\n\t"
+        "st1w {za2h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
+        "add %[Ch2], %[Ch2], #64\n\t"
+        "st1w {za3h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
+        "add %[Ch2], %[Ch2], #64\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 2b\n\t"
         "smstop za\n\t"
         "smstop sm\n\t"
         : [A] "+r" (A), [A1] "+r" (A1), [B] "+r" (B), [B1] "+r" (B1),
-          [Cl] "+r" (Cl), [Ch] "+r" (Ch), [K] "+r" (K)
+          [Cl] "+r" (Cl), [Ch] "+r" (Ch), [Cl2] "+r" (Cl2), [Ch2] "+r" (Ch2),
+          [K] "+r" (K)
         :
         : "memory", "w12"
     );
@@ -152,9 +177,6 @@ void kirby_sgemm_fp32(int M, int N, int K,
     }
 
     /* B: row-major KxM 已符合 microkernel 约定 (每行连续), 无需转换 */
-
-    /* zero C (microkernel 覆盖式输出, 假设初始 0) */
-    for (int i = 0; i < M * M; i++) C[i] = 0.0f;
 
     if (M == 16) {
         micro_16x16_kupdate(C, A_col, B, K);

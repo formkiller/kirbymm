@@ -64,8 +64,10 @@ static int run_case(int M, int N, int K,
 
     fill_random(A, M, K);
     fill_random(B, K, N);
-    zero_mat(C_ref, M, N);
-    zero_mat(C_test, M, N);
+    /* C 用随机非零初值 (验证完整 C += A*B 累加语义, 非覆盖式)
+     * 先填 C_ref, 再 memcpy 到 C_test 保证两者初值相同 */
+    fill_random(C_ref, M, N);
+    memcpy(C_test, C_ref, sizeof(float) * (size_t)M * (size_t)N);
 
     ref(M, N, K, A, B, C_ref);
     test(M, N, K, A, B, C_test);
