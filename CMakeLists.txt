@@ -37,6 +37,10 @@ add_executable(fmopa_sanity tools/fmopa_sanity.c)
 add_executable(verify test/verify.c)
 target_link_libraries(verify PRIVATE kirbymm m)
 
-# ---- KirbyMM 库 (主例程, 当前 16x16 单瓦片, fallback naive) ----
+# ---- 性能基准 (naive vs kirby GFLOPS 对照) ----
+add_executable(bench test/bench.c)
+target_link_libraries(bench PRIVATE kirbymm naive)
+
+# ---- KirbyMM 库 (主例程: 16x16 单瓦片 + 32x32 4-tile + MacroKernel 块遍历) ----
 add_library(kirbymm micro/primary.c)
 target_link_libraries(kirbymm PUBLIC naive)
