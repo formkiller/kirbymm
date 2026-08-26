@@ -72,6 +72,49 @@ static void micro_16x16_kupdate(float *C, const float *A, const float *B, int K)
     );
 }
 
+/* ZA-tile 隐式转置打包 (论文 §V-B, Fig.10)
+ * 把 row-major 16×16 子块转置成 col-major 16×16
+ * 流程:
+ *   1. 16 行 ld1w 加载进 za0 (水平 slice = 行, 连续读 src 行)
+ *   2. 16 列 st1w 从 za0 读出 (垂直 slice = 列, 连续写 dst 列)
+ * src: row-major 16×16, 行距 src_stride (元素)
+ * dst: col-major 16×16, 列距 16 (元素)
+ */
+__attribute__((target("sve,sme")))
+static void za_transpose_16x16(float *dst, int dst_stride,
+                                const float *src, int src_stride) {
+    float *s = (float *)src;
+    float *d = dst;
+    long src_skip = (long)(src_stride - 16) * 4;  /* 行间跳距: src 下一行 */
+    long dst_skip = (long)(dst_stride - 16) * 4;  /* 列间跳距: dst 下一列 */
+    __asm__ volatile(
+        "smstart sm\n\t"
+        "smstart za\n\t"
+        "ptrue p0.s, all\n\t"
+        /* 16 行加载进 za0 (水平 slice, 连续读 src 行) */
+        "mov w12, #0\n\t"
+        "1:\n\t"
+        "ld1w {za0h.s[w12, 0]}, p0/z, [%[s]]\n\t"
+        "add %[s], %[s], %[ss]\n\t"
+        "add w12, w12, #1\n\t"
+        "cmp w12, #16\n\t"
+        "b.ne 1b\n\t"
+        /* 16 列从 za0 读出到 dst (垂直 slice, 连续写 dst 列) */
+        "mov w12, #0\n\t"
+        "2:\n\t"
+        "st1w {za0v.s[w12, 0]}, p0, [%[d]]\n\t"
+        "add %[d], %[d], %[ds]\n\t"
+        "add w12, w12, #1\n\t"
+        "cmp w12, #16\n\t"
+        "b.ne 2b\n\t"
+        "smstop za\n\t"
+        "smstop sm\n\t"
+        : [s] "+r" (s), [d] "+r" (d)
+        : [ss] "r" (src_skip), [ds] "r" (dst_skip)
+        : "memory", "w12"
+    );
+}
+
 /* 32×32 主例程 microkernel (论文 §IV-A, Fig.7 严格复现)
  * C: 32×32 row-major (行距 32 = 128 字节, 连续块)
  * A: col-major 32 × K (每列 32 FP32 连续)
@@ -213,15 +256,32 @@ void kirby_sgemm_fp32(int M, int N, int K,
             for (int i = 0; i < M; i += BLKM) {
                 int blkm = (i + BLKM <= M) ? BLKM : (M - i);
 
-                /* pack A[i:i+blkm, k:k+blkk] → A_block
-                 * 按 32 行子块组织, 每子块 col-major 32×blkk (列距 32) */
+                /* pack A[i:i+blkm, k:k+blkk] → A_block (§V-B ZA-tile 隐式转置)
+                 * 32×blkk 分成 2×(blkk/16) 个 16×16 子块, 每个 ZA tile 转置
+                 * src: A row-major 16×16, 行距 K (连续读行)
+                 * dst: A_block col-major 16×16, 列距 32 (连续写列) */
                 int m_blocks = (blkm + SI - 1) / SI;
                 for (int ib = 0; ib < m_blocks; ib++) {
                     int si_cur = (ib * SI + SI <= blkm) ? SI : (blkm - ib * SI);
-                    for (int kk = 0; kk < blkk; kk++)
-                        for (int ii = 0; ii < si_cur; ii++)
-                            A_block[(size_t)ib * BLKK * SI + (size_t)kk * SI + ii] =
-                                A[(size_t)(i + ib * SI + ii) * K + (k + kk)];
+                    for (int bi = 0; bi < si_cur / 16; bi++) {
+                        for (int bk = 0; bk + 16 <= blkk; bk += 16) {
+                            za_transpose_16x16(
+                                A_block + (size_t)ib * BLKK * SI + (size_t)bk * SI + bi * 16,
+                                SI,   /* dst_stride = 32 (A_block col-major 列距) */
+                                A + (size_t)(i + ib * SI + bi * 16) * K + (k + bk),
+                                K     /* src_stride = K (A row-major 行距) */
+                            );
+                        }
+                        /* 余数列 (blkk 非 16 倍数), 简单循环兜底 */
+                        int rem = blkk % 16;
+                        if (rem > 0) {
+                            int bk = blkk - rem;
+                            for (int kk = 0; kk < rem; kk++)
+                                for (int ii = 0; ii < 16; ii++)
+                                    A_block[(size_t)ib * BLKK * SI + (size_t)(bk + kk) * SI + bi * 16 + ii] =
+                                        A[(size_t)(i + ib * SI + bi * 16 + ii) * K + (k + bk + kk)];
+                        }
+                    }
                 }
 
                 /* L4: jj 循环 (sj=32) */
