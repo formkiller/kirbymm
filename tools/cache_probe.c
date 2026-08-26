@@ -99,19 +99,22 @@ static void probe_stride_latency(void) {
     printf("\n(注: 真实 L1/L2 边界应以 sysctl 容量为准, 此探测仅供交叉参考)\n\n");
 }
 
-/* noinline 读归约函数: 阻止 -O3 跨函数优化消除读取
- * 编译器不能跨 noinline 边界分析, 必须真正读 buf
- * 内部仍可向量化 (测真实带宽, 非标量下限) */
+/* 全局 volatile sink: 制造副作用, 阻止编译器把读函数标记为纯函数
+ * 从而阻止跨调用缓存返回值 (之前 noinline 仍被识别为纯函数而缓存) */
+static volatile uint64_t g_sink = 0;
+
+/* noinline + 写全局 volatile: 双重阻止优化
+ * 内部 acc += buf[i] 仍可向量化 (buf 非 volatile, 测真实带宽) */
 __attribute__((noinline))
-static uint64_t read_reduce(const uint64_t *buf, size_t count) {
+static void read_and_sink(const uint64_t *buf, size_t count) {
     uint64_t acc = 0;
     for (size_t i = 0; i < count; i++) {
         acc += buf[i];
     }
-    return acc;
+    g_sink ^= acc;  /* 副作用: 写全局 volatile, 阻止纯函数 + 跨调用缓存 */
 }
 
-/* 带宽探测: 调用 noinline 读函数, 测真实内存带宽 */
+/* 带宽探测: 调用 noinline+volatile-sink 读函数, 测真实内存带宽 */
 static void probe_bandwidth(void) {
     printf("--- memory bandwidth probe (B_max for Eq.5) ---\n");
     size_t bytes = 64 * 1024 * 1024;  /* 64MB, 远超 L2 */
@@ -123,19 +126,17 @@ static void probe_bandwidth(void) {
     for (size_t i = 0; i < count; i++) buf[i] = i * 7 + 1;
 
     int reps = 20;
-    uint64_t checksum = 0;
 
     /* warmup */
-    checksum ^= read_reduce(buf, count);
+    read_and_sink(buf, count);
 
     double t0 = now_sec();
     for (int r = 0; r < reps; r++) {
-        checksum ^= read_reduce(buf, count);  /* noinline, 必须真正读 */
+        read_and_sink(buf, count);  /* noinline + volatile sink, 必须真正读 */
     }
     double dt = now_sec() - t0;
 
-    /* 输出 checksum, 阻止整体消除 */
-    printf("(checksum: %lu, reps=%d)\n", (unsigned long)checksum, reps);
+    printf("(sink=%lu, reps=%d, dt=%.6f s)\n", (unsigned long)g_sink, reps, dt);
 
     double gbs = (double)bytes * reps / dt / 1e9;
     printf("64MB stream read x%d: %.2f GB/s\n", reps, gbs);
