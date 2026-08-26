@@ -64,13 +64,13 @@ static void probe_sysctl(void) {
 }
 
 /* 步进探测: 不同 stride 的访问延迟, 找 L1/L2 边界
- * 原理: 工作集 < L1 时延迟低, 超出 L1 进 L2 时延迟跳升 */
+ * 注意: -O3 向量化会把顺序访问合并, 测的是吞吐而非单次延迟
+ * 此法不可靠, 仅作参考. 真实延迟应用 pointer chasing (后续补) */
 static void probe_stride_latency(void) {
-    printf("--- stride latency probe (识别 L1/L2 边界) ---\n");
-    printf("%-12s %12s\n", "workset", "latency(ns)");
+    printf("--- stride latency probe (受 -O3 向量化影响, 数字仅供参考) ---\n");
+    printf("%-12s %12s\n", "workset", "throughput(ns/elem)");
     printf("-----------------------------\n");
 
-    /* 测试不同工作集大小: 4KB → 16MB */
     size_t sizes[] = {4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 16384};
     int n = (int)(sizeof(sizes)/sizeof(sizes[0]));
 
@@ -81,14 +81,12 @@ static void probe_stride_latency(void) {
         if (!buf) continue;
         memset(buf, 0, bytes);
 
-        /* 链表式访问: 每个 element 指向下一个, stride 跨 cacheline 制造冲突 */
-        /* 简化: 顺序访问所有 element, 多次循环 */
         volatile uint64_t sink = 0;
         double t0 = now_sec();
         int reps = 1000;
         for (int r = 0; r < reps; r++) {
             for (size_t i = 0; i < count; i++) {
-                buf[i] += i;  /* 读写, 强制进缓存 */
+                buf[i] += i;
                 sink += buf[i];
             }
         }
@@ -98,34 +96,45 @@ static void probe_stride_latency(void) {
         printf("%-8zu KB %12.2f\n", sizes[si], ns_per);
         free(buf);
     }
-    printf("\n(延迟跳升处即 L1→L2 边界, 再跳升即 L2→内存)\n\n");
+    printf("\n(注: 真实 L1/L2 边界应以 sysctl 容量为准, 此探测仅供交叉参考)\n\n");
 }
 
-/* 带宽探测: 连续 load 测 B_max (Eq.5 用) */
+/* 带宽探测: memcpy 测 B_max (不能被优化掉, OS 高度优化)
+ * memcpy = 1 read + 1 write, 纯读带宽 ≈ 总带宽的一半 */
 static void probe_bandwidth(void) {
     printf("--- memory bandwidth probe (B_max for Eq.5) ---\n");
     size_t bytes = 64 * 1024 * 1024;  /* 64MB, 远超 L2, 测真实内存带宽 */
-    size_t count = bytes / sizeof(uint64_t);
-    uint64_t *buf = (uint64_t *)malloc(bytes);
-    if (!buf) { printf("alloc failed\n"); return; }
-    memset(buf, 0, bytes);
+    uint8_t *src = (uint8_t *)malloc(bytes);
+    uint8_t *dst = (uint8_t *)malloc(bytes);
+    if (!src || !dst) { printf("alloc failed\n"); return; }
+    memset(src, 0xAB, bytes);
 
-    volatile uint64_t sink = 0;
+    /* warmup */
+    memcpy(dst, src, bytes);
     int reps = 50;
     double t0 = now_sec();
     for (int r = 0; r < reps; r++) {
-        uint64_t acc = 0;
-        for (size_t i = 0; i < count; i++) {
-            acc += buf[i];  /* 纯读, 流式 */
-        }
-        sink += acc;
+        memcpy(dst, src, bytes);
     }
     double dt = now_sec() - t0;
-    double gb_s = (double)bytes * reps / dt / 1e9;
+    /* memcpy = read + write, 总数据移动 = 2*bytes*reps */
+    double total_gbs = (double)bytes * 2.0 * reps / dt / 1e9;
+    double read_gbs = (double)bytes * reps / dt / 1e9;  /* 纯读估计 */
 
-    printf("64MB stream read: %.2f GB/s = %.2f GB/s\n\n", gb_s, gb_s);
-    printf("B_max ≈ %.2f GB/s (代入 Eq.5: I_max = P_peak/B_max)\n", gb_s);
-    free(buf);
+    printf("memcpy 64MB x%d: total %.2f GB/s (read+write)\n", reps, total_gbs);
+    printf("B_max (read est) ≈ %.2f GB/s\n\n", read_gbs);
+    printf("代入 Eq.5: I_max = P_peak / B_max = 512 / %.2f = %.2f FLOP/byte\n",
+           read_gbs, 512.0 / read_gbs);
+    free(src); free(dst);
+}
+
+/* 相联度假设 (Apple 不暴露, 用典型值, 待 conflict 探测验证) */
+static void print_assoc_assumption(void) {
+    printf("--- associativity assumption (待验证) ---\n");
+    printf("Apple M4 P-core 典型: L1d 8-way, L2 16-way (公开资料不确认)\n");
+    printf("L1: 64KB / (8 × 128B) = 64 组\n");
+    printf("L2: 4MB / (16 × 128B) = 2048 组\n");
+    printf("(后续可加 conflict miss 探测实测相联度)\n\n");
 }
 
 int main(void) {
@@ -133,6 +142,7 @@ int main(void) {
     probe_sysctl();
     probe_stride_latency();
     probe_bandwidth();
+    print_assoc_assumption();
     printf("\n=== probe done ===\n");
     return 0;
 }
