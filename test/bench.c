@@ -94,7 +94,7 @@ int main(void) {
                s, gn, gk, gk / gn, gk / 1425.13 * 100, gk / 2253.0 * 100);
     }
 
-    printf("\n(ref: kernel-only v6 diff-protocol: ldc=256 tailD 1506 GFLOPS = 105.7% fig13;\n");
+    printf("\n(ref: kernel-only v6 diff-protocol: ldc=256 tailD 1506 GFLOPS = 105.7%% fig13;\n");
     printf(" K=512 kernel up to 1860 GFLOPS = 82.6%% theoretical. fig13 = 1425.13 GFLOPS,\n");
     printf(" theor = 1 fmopa/cycle @ 4.4GHz = 2253 GFLOPS. old ~512-peak calibration retired.)\n");
     return 0;
