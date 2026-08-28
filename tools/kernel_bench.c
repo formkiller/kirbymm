@@ -1,22 +1,26 @@
 /*
- * kernel_bench.c v4 — 计时器自验证版
+ * kernel_bench.c v5 — 穿越式计时 (garbage-immune rounds)
  *
- * v3 在 M4 上的诊断结论:
- *   - t0=t1=0.000000000 恒成立 → clock_gettime(CLOCK_MONOTONIC) 在该环境恒返回 {0,0}
- *   - bench.c 的 mach_absolute_time 路径此前打印过 779 GFLOPS → mach 计时器已证实可用
- *   - v3 源码下 dt=0 应得 g=+inf → DIAG "best=0" 在 IEEE 语义下不可能出现
- *     → 两种可能: (a) 该环境除零非 IEEE (返回 0/NaN); (b) 二进制与仓库源码分歧
- * v4 对策:
- *   1. APPLE 首选 mach_absolute_time (已证实可用), clock_gettime 作候选;
- *      每个候选过 50ms sleep 自检 (读数差必须落在 (0.03, 1.0) s), 死了换下一个
- *   2. IEEE 除零探针: volatile 1.0/0.0 必须 = +inf (运行期除法, 防 -O3 折叠)
- *   3. 哨兵算术: dt<=0 → 返回 -1 (永不产生 inf/NaN), 全灭轮打印 TIMER DEAD + 原始读数
- *   4. __DATE__/__TIME__ 编译戳 → 甄别陈旧二进制 (与 cmake 构建时间对照)
- *   5. 探针接线自检保留 (v3 已验证 probe 数值正确: 0/1024 mismatch)
+ * v2~v4 诊断结论链 (M4):
+ *   - IEEE 除零正常 (v4: 1/0=inf), 探针接线正常 (0/1024), mach 计时器 SME 前正常
+ *   - 故障模式: 计时读数在 SME 密集调用上下文中错乱 —
+ *     v3 clock_gettime 读数恒 0; v4 mach 在 bench 中 dt=0/跳变, 在 selftest 中正常
+ *   - 推论: 不是计时器坏, 是 SME 往返 (smstart/smstop) 之后的读数窗口不可靠
+ *   - bench.c 的 779 仍可信: t0(SME前)/t1(SME后) 均真实, 否则会打印负数或 0.00
+ * v5 对策 — 不修计时器, 让每轮计时自带防伪:
+ *   1. 三计时器候选: mach_absolute_time / clock_gettime / cntvct_el0 (raw 计数器,
+ *      与前两者 API 无关的独立见证; SIGILL 探测可用性)
+ *   2. 每轮: t0 取 3 读 max (吸收 0 值垃圾), t1 取 3 读 max;
+ *      校验 1e-6 s < dt < 10 s (round 真实耗时 ~0.7-1.5 ms, 上下界放宽到 6 个数量级)
+ *      — 0 读数 / 冻结 / 巨大跳变全部进不了统计
+ *   3. 每用例最多 42 次尝试收满 7 个有效轮, best-of-valid; 打印 n_valid
+ *   4. 用例 (a) 倾泻前 12 次尝试的原始读数 (t0/t1/dt/verdict) — 垃圾模式留档
+ *   5. SME 前/后各跑一轮计时器自检 (50ms sleep) — 直接量化 "SME 后计时器失灵"
+ *   6. 防优化消除: 每轮后 benchmark_sink += C32[0], 结束打印 (调用链必须保留)
  *
- * 方法: 预分配 A/B/C, kernel 重复调用 (C += A*B 累加语义), best-of-7 取最快轮
+ * 方法: 预分配 A/B/C, kernel 重复调用 (C += A*B 累加语义)
  * 数值安全: K=512, reps=500 时 C 元素 ~ N(0, 20^2), 远离溢出/denormal
- * v2 修复保留: A32/B32 按 K 上限 1024 分配 (v1 在 K=512 用例越界读堆)
+ * v2 修复保留: A32/B32 按 K 上限 1024 分配
  */
 #ifndef __APPLE__
 #define _POSIX_C_SOURCE 200809L
@@ -26,131 +30,195 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #ifdef __APPLE__
   #include <mach/mach_time.h>
 #endif
 
-/* ---------- 计时器层: 双候选 + 运行时自检 ---------- */
-static int g_timer = 0;   /* 1 = mach_absolute_time (APPLE), 2 = clock_gettime */
+/* ---------- 计时器候选层 ---------- */
 
+static double read_clock(void);   /* 前向声明 (read_mach 非 APPLE 回退用) */
+
+static double read_mach(void) {
 #ifdef __APPLE__
-static double now_mach(void) {
     static mach_timebase_info_data_t tb;
     static int inited = 0;
     if (!inited) { mach_timebase_info(&tb); inited = 1; }
     return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom / 1e9;
-}
+#else
+    return read_clock();
 #endif
+}
 
-static double now_clock(void) {
+static double read_clock(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static double now_sec(void) {
-#ifdef __APPLE__
-    if (g_timer == 1) return now_mach();
-#endif
-    return now_clock();
+#if defined(__aarch64__)
+static double read_cntvct(void) {
+    static double inv_freq = 0.0;
+    if (inv_freq == 0.0) {
+        unsigned long long f;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        inv_freq = (double)f;
+    }
+    unsigned long long v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return (double)v / inv_freq;
 }
 
-static const char *timer_name(int id) {
 #ifdef __APPLE__
-    if (id == 1) return "mach_absolute_time";
+/* SIGILL 探测 cntvct_el0 用户态可读性 (macOS 一般放行, 防意外) */
+static sigjmp_buf g_ill_jb;
+static void on_sigill(int sig) { (void)sig; siglongjmp(g_ill_jb, 1); }
+static int cntvct_available(void) {
+    struct sigaction sa, old;
+    sa.sa_handler = on_sigill;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGILL, &sa, &old);
+    if (sigsetjmp(g_ill_jb, 1) == 0) {
+        unsigned long long f, v;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+        sigaction(SIGILL, &old, NULL);
+        return (f > 0);
+    }
+    sigaction(SIGILL, &old, NULL);
+    return 0;
+}
 #else
-    (void)id;
-#endif
-    return "clock_gettime(CLOCK_MONOTONIC)";
+/* Linux aarch64 用户态恒可读 generic timer */
+static int cntvct_available(void) { return 1; }
+#endif   /* __APPLE__ */
+
+#else    /* 非 aarch64 宿主: cntvct 桩 (标记不可用) */
+static double read_cntvct(void) { return 0.0; }
+static int cntvct_available(void) { return 0; }
+#endif   /* __aarch64__ */
+
+typedef struct { const char *name; double (*read)(void); int avail; } timer_t;
+static timer_t g_timers[3] = {
+    { "mach_absolute_time", read_mach,   0 },
+    { "clock_gettime",      read_clock,  0 },
+    { "cntvct_el0",         read_cntvct, 0 },
+};
+static const int N_TIMERS = 3;
+
+/* 自检: 预热 3 读 (吸收坏读) + 50ms sleep + 前后读; 返回 dt, 调用方判界 */
+static double timer_selftest_dt(int id) {
+    double sink;
+    sink = g_timers[id].read(); (void)sink;
+    sink = g_timers[id].read(); (void)sink;
+    double t0 = g_timers[id].read();
+    struct timespec req = {0, 50 * 1000 * 1000};
+    nanosleep(&req, NULL);
+    double t1 = g_timers[id].read();
+    return t1 - t0;
 }
 
-/* 自检: 50ms sleep 前后读数差必须合理 (NaN/0/过大都判死); 返回 1=可用 */
-static int timer_selftest(int id) {
-    g_timer = id;
-    double t0 = now_sec();
-    struct timespec req = {0, 50 * 1000 * 1000};   /* 50 ms */
-    nanosleep(&req, NULL);
-    double t1 = now_sec();
-    double d = t1 - t0;
-    int ok = (d > 0.03 && d < 1.0);
-    printf("  timer[%s] selftest: 50ms sleep -> %.6f s  [%s]\n",
-           timer_name(id), d, ok ? "OK" : "DEAD");
-    return ok;
+static void run_selftests(const char *phase) {
+    printf("[%s SME] timer selftests (50ms sleep):\n", phase);
+    for (int i = 0; i < N_TIMERS; i++) {
+        if (!g_timers[i].avail) { printf("  timer[%s] unavailable\n", g_timers[i].name); continue; }
+        double d = timer_selftest_dt(i);
+        int ok = (d > 0.03 && d < 1.0);
+        printf("  timer[%s] -> %.6f s  [%s]\n", g_timers[i].name, d, ok ? "OK" : "DEAD");
+    }
+}
+
+/* 挑一个 SME 后自检通过的计时器; 全灭返回 -1 */
+static int pick_timer_post_sme(void) {
+    for (int i = 0; i < N_TIMERS; i++) {
+        if (!g_timers[i].avail) continue;
+        double d = timer_selftest_dt(i);
+        if (d > 0.03 && d < 1.0) return i;
+    }
+    return -1;
 }
 
 /* ---------- 被测对象 ---------- */
 #include "kirby.h"
 
-/* [仅测试用] 探针: primary.c 导出, 直通 micro_32x32_kupdate */
 void kirby_kernel_probe(float *C, int ldc, const float *A, const float *B, int K);
 
 static float *A32, *B32, *C32;
+static double benchmark_sink = 0.0;   /* 防优化消除 */
 
-/* 单轮计时: kernel 重复调用 reps 次; 回传 t0/t1/dt 供诊断
- * 哨兵: dt<=0 返回 -1 (计时死/倒退), 永不产生 inf/NaN */
-static double bench_once(int ldc, int K, int reps,
-                         double *dt_out, double *t0_out, double *t1_out) {
-    kirby_kernel_probe(C32, ldc, A32, B32, K);   /* 预热 */
-    double t0 = now_sec();
+/* 单轮: 预热 + 吸收读 + t0(3读max) + reps 次 kernel + t1(3读max); 返回 dt (原始) */
+static double timed_round(int tid, int ldc, int K, int reps) {
+    kirby_kernel_probe(C32, ldc, A32, B32, K);              /* 预热 (SME) */
+    volatile double sink = g_timers[tid].read(); (void)sink; /* 吸收坏读 */
+    sink = g_timers[tid].read(); (void)sink;
+    double t0 = g_timers[tid].read();
+    for (int i = 0; i < 2; i++) {                            /* t0: 3 读取 max */
+        double t = g_timers[tid].read();
+        if (t > t0) t0 = t;
+    }
     for (int r = 0; r < reps; r++)
         kirby_kernel_probe(C32, ldc, A32, B32, K);
-    double t1 = now_sec();
-    double dt = t1 - t0;
-    if (dt_out) *dt_out = dt;
-    if (t0_out) *t0_out = t0;
-    if (t1_out) *t1_out = t1;
-    if (!(dt > 0.0)) return -1.0;
-    return 2.0 * 32.0 * 32.0 * K * reps / dt / 1e9;
+    double t1 = g_timers[tid].read();                        /* t1: 3 读取 max */
+    for (int i = 0; i < 2; i++) {
+        double t = g_timers[tid].read();
+        if (t > t1) t1 = t;
+    }
+    benchmark_sink += C32[0];                                /* 调用链活性 */
+    return t1 - t0;
 }
 
-static int any_invalid = 0;
+static int any_case_failed = 0;
 
-/* best-of-7: 峰值定标取最快轮 (OS 抖动/降频轮直接淘汰) */
-static void bench_case(const char *name, int ldc, int K, int reps) {
-    double best = -1.0, dt0 = -1.0, ta0 = 0.0, tb0 = 0.0;
-    for (int round = 0; round < 7; round++) {
-        double dt, ta, tb;
-        double g = bench_once(ldc, K, reps, &dt, &ta, &tb);
-        if (round == 0) { dt0 = dt; ta0 = ta; tb0 = tb; }
-        if (g > best) best = g;
+/* best-of-valid: 最多 42 次尝试收 7 个有效轮 (1e-6 s < dt < 10 s) */
+static void bench_case(const char *name, int ldc, int K, int reps,
+                       int tid, int dump_raw) {
+    double best = -1.0, dt0 = -1.0;
+    int n_valid = 0, n_try = 0;
+    for (int attempt = 0; attempt < 42 && n_valid < 7; attempt++) {
+        double dt = timed_round(tid, ldc, K, reps);
+        n_try++;
+        if (dump_raw && attempt < 12)
+            printf("    try#%-2d t=%-18s dt=%.9f s  [%s]\n",
+                   attempt + 1, g_timers[tid].name, dt,
+                   (dt > 1e-6 && dt < 10.0) ? "valid" : "REJECT");
+        if (dt > 1e-6 && dt < 10.0) {
+            if (dt0 < 0) dt0 = dt;
+            n_valid++;
+            double g = 2.0 * 32.0 * 32.0 * K * reps / dt / 1e9;
+            if (g > best) best = g;
+        }
     }
-    if (best < 0.0) {
-        any_invalid = 1;
-        printf("  [%-28s] TIMER DEAD | round0 t0=%.9f t1=%.9f dt=%.9f (all 7 rounds)\n",
-               name, ta0, tb0, dt0);
+    if (n_valid == 0) {
+        any_case_failed = 1;
+        printf("  [%-28s] NO VALID ROUNDS (42 tries, timer=%s)\n",
+               name, g_timers[tid].name);
         return;
     }
-    printf("  [%-28s] ldc=%4d K=%4d reps=%5d  %8.2f GFLOPS   (round0 dt=%8.3f ms)\n",
-           name, ldc, K, reps, best, dt0 * 1e3);
+    printf("  [%-28s] ldc=%4d K=%4d reps=%5d  %8.2f GFLOPS   "
+           "(valid %d/42, round0 dt=%8.3f ms)\n",
+           name, ldc, K, reps, best, n_valid, dt0 * 1e3);
 }
 
 int main(void) {
-    printf("=== microkernel-only benchmark v4 (selftest) ===\n");
+    printf("=== microkernel-only benchmark v5 (garbage-immune) ===\n");
     printf("build stamp: %s %s\n", __DATE__, __TIME__);
 
-    /* IEEE 除零探针 (volatile 防 -O3 折叠): 非零/0 必须 = +inf */
-    {
+    {   /* IEEE 除零探针 */
         volatile double one = 1.0, zero = 0.0;
         double r = one / zero;
-        int ieee_ok = isinf(r) && r > 0;
-        printf("IEEE check: 1/0 -> %g (expect inf)%s\n",
-               r, ieee_ok ? "" : "  << ANOMALY: 除零非IEEE!");
+        printf("IEEE check: 1/0 -> %g (expect inf)%s\n", r,
+               (isinf(r) && r > 0) ? "" : "  << ANOMALY!");
     }
 
-    /* 计时器自检 + 选择 (APPLE: mach 优先 — bench.c 779 已证实可用) */
-    int picked = 0;
-#ifdef __APPLE__
-    if (!picked && timer_selftest(1)) picked = 1;
-#endif
-    if (!picked && timer_selftest(2)) picked = 2;
-    if (!picked) {
-        printf("FATAL: 所有计时器自检失败 (系统时钟冻结?) — 无法测量\n");
-        return 2;
-    }
-    printf("  using timer: %s\n\n", timer_name(g_timer));
+    /* 计时器可用性 + SME 前自检 */
+    g_timers[2].avail = cntvct_available();
+    g_timers[0].avail = 1; g_timers[1].avail = 1;
+    run_selftests("PRE");
 
-    /* A/B 按 K 上限 1024 分配 (v1 的 32x256 在 K=512 用例越界读) */
+    /* A/B 按 K 上限 1024 分配 */
     A32 = malloc(sizeof(float) * 32 * 1024);
     B32 = malloc(sizeof(float) * 1024 * 32);
     C32 = malloc(sizeof(float) * 1024 * 1024);
@@ -158,7 +226,7 @@ int main(void) {
     for (int i = 0; i < 1024 * 32; i++) B32[i] = 0.01f * ((i % 5) - 2);
     memset(C32, 0, sizeof(float) * 1024 * 1024);
 
-    /* 探针接线自检: probe(ldc=32, K=64) vs 纯 C 参照 — 证明测的不是空转 */
+    /* 探针接线自检 (SME!) */
     {
         float *ref = malloc(sizeof(float) * 32 * 32);
         memset(ref, 0, sizeof(float) * 32 * 32);
@@ -179,25 +247,46 @@ int main(void) {
         memset(C32, 0, sizeof(float) * 1024 * 1024);
     }
 
-    /* (a) ldc=32: 连续 32x32 块, 等价打包版布局 (直连收益归因基准点) */
-    bench_case("packed-layout (ldc=32)", 32, 128, 2000);
-    /* (b) ldc=1024: 直连 1024 大矩阵的行距 (离散写回) */
-    bench_case("direct-C (ldc=1024)", 1024, 128, 2000);
-    /* (c) ldc=512/256/128: 中间档位 (bench.c 实际扫描的 N 序列) */
-    bench_case("direct-C (ldc=512)", 512, 128, 2000);
-    bench_case("direct-C (ldc=256)", 256, 128, 2000);
-    bench_case("direct-C (ldc=128)", 128, 128, 2000);
-    /* (d) ldc=32 K=512: K 变长吞吐 (更长 K 循环摊薄载入写回) */
-    bench_case("packed-layout (ldc=32) K=512", 32, 512, 500);
-    /* (e) ldc=1024 K=512: 直连大 ldc 下 K 变长 */
-    bench_case("direct-C (ldc=1024) K=512", 1024, 512, 500);
+    /* SME 后自检 — 直接量化 "SME 往返后计时器失灵" 假设 */
+    run_selftests("POST");
+    int tid = pick_timer_post_sme();
+    if (tid < 0) {
+        printf("\nFATAL: 所有计时器在 SME 后自检失败 — 20 次原始读数留档:\n");
+        for (int i = 0; i < N_TIMERS; i++) {
+            if (!g_timers[i].avail) continue;
+            printf("  timer[%s]:", g_timers[i].name);
+            for (int k = 0; k < 20; k++) {
+                struct timespec req = {0, 1000 * 1000};  /* 1ms */
+                nanosleep(&req, NULL);
+                printf(" %.6f", g_timers[i].read());
+            }
+            printf("\n");
+        }
+        printf("-> 无计时通道; 改用 plan B (bench.c 全 GEMM 外推) 定标\n");
+        free(A32); free(B32); free(C32);
+        return 4;
+    }
+    printf("  bench timer: %s\n\n", g_timers[tid].name);
 
-    if (any_invalid) {
-        printf("\nRESULT: 有无效用例 — 见上方 TIMER DEAD/ANOMALY 行\n");
+    /* (a) 基准点 + 原始读数倾泻 (垃圾模式留档) */
+    bench_case("packed-layout (ldc=32)", 32, 128, 2000, tid, 1);
+    /* (b) 直连大矩阵行距 */
+    bench_case("direct-C (ldc=1024)", 1024, 128, 2000, tid, 0);
+    /* (c) 中间档位 */
+    bench_case("direct-C (ldc=512)", 512, 128, 2000, tid, 0);
+    bench_case("direct-C (ldc=256)", 256, 128, 2000, tid, 0);
+    bench_case("direct-C (ldc=128)", 128, 128, 2000, tid, 0);
+    /* (d) K 变长 */
+    bench_case("packed-layout (ldc=32) K=512", 32, 512, 500, tid, 0);
+    bench_case("direct-C (ldc=1024) K=512", 1024, 512, 500, tid, 0);
+
+    printf("\nsink=%.6g (防消除校验, 非零即调用链完整)\n", benchmark_sink);
+    if (any_case_failed) {
+        printf("RESULT: 有用例无有效轮 — 见上方, 计时环境需进一步留档\n");
         free(A32); free(B32); free(C32);
         return 3;
     }
-    printf("\n(对比 bench.c 整体数字: 整体 GFLOPS / kernel GFLOPS = 调度效率)\n");
+    printf("(对比 bench.c 整体数字: 整体 GFLOPS / kernel GFLOPS = 调度效率)\n");
     printf("(M4 真实 SME 峰值 ~ kernel GFLOPS 上限; 以此修正 bench.c 口径)\n");
     free(A32); free(B32); free(C32);
     return 0;
