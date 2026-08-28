@@ -249,7 +249,9 @@ static void micro_32x32_kupdate(float *C, int ldc, const float *A, const float *
     float *Ch = C + 16 * ldc;     /* C 初值加载: 高 16 行起点 (偏移 16 行 × ldc) */
     float *Cl2 = C;               /* 写回: 低 16 行起点 */
     float *Ch2 = C + 16 * ldc;    /* 写回: 高 16 行起点 */
-    long c_row  = (long)ldc * 4 * 2; /* C 行宽 ×2 = 两次半行推进的行跳 (ldc=32 时 128B) */
+    /* 行内: 左半(64B) + 右半(64B) 后, 再跳 cs = 行宽-64B 到下一行行首
+     * 净进 = 64 + cs = ldc*4 字节 = 恰好一行; ldc=32 时 cs=64, 与打包版两次 +64 等价 */
+    long cs = (long)ldc * 4 - 64;
     const float *A1 = A + 16;     /* A 列后 16 行 */
     const float *B1 = B + 16;     /* B 行后 16 列 */
     __asm__ volatile(
@@ -264,13 +266,11 @@ static void micro_32x32_kupdate(float *C, int ldc, const float *A, const float *
         "ld1w {za0h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
         "add %[Cl], %[Cl], #64\n\t"
         "ld1w {za1h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
-        "add %[Cl], %[Cl], %[cr]\n\t"
-        "sub %[Cl], %[Cl], #64\n\t"
+        "add %[Cl], %[Cl], %[cs]\n\t"
         "ld1w {za2h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
         "add %[Ch], %[Ch], #64\n\t"
         "ld1w {za3h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
-        "add %[Ch], %[Ch], %[cr]\n\t"
-        "sub %[Ch], %[Ch], #64\n\t"
+        "add %[Ch], %[Ch], %[cs]\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 3b\n\t"
@@ -296,13 +296,11 @@ static void micro_32x32_kupdate(float *C, int ldc, const float *A, const float *
         "st1w {za0h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
         "add %[Cl2], %[Cl2], #64\n\t"
         "st1w {za1h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
-        "add %[Cl2], %[Cl2], %[cr]\n\t"
-        "sub %[Cl2], %[Cl2], #64\n\t"
+        "add %[Cl2], %[Cl2], %[cs]\n\t"
         "st1w {za2h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
         "add %[Ch2], %[Ch2], #64\n\t"
         "st1w {za3h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
-        "add %[Ch2], %[Ch2], %[cr]\n\t"
-        "sub %[Ch2], %[Ch2], #64\n\t"
+        "add %[Ch2], %[Ch2], %[cs]\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 2b\n\t"
@@ -311,7 +309,7 @@ static void micro_32x32_kupdate(float *C, int ldc, const float *A, const float *
         : [A] "+r" (A), [A1] "+r" (A1), [B] "+r" (B), [B1] "+r" (B1),
           [Cl] "+r" (Cl), [Ch] "+r" (Ch), [Cl2] "+r" (Cl2), [Ch2] "+r" (Ch2),
           [K] "+r" (K)
-        : [cr] "r" (c_row)
+        : [cs] "r" (cs)
         : "memory", "w12"
     );
 }
