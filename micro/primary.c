@@ -450,3 +450,8 @@ void kirby_sgemm_fp32(int M, int N, int K,
 
     free(A_block); free(B_panel);
 }
+
+/* [仅测试用] microkernel 裸性能探针 (见 kirby.h 注释) */
+void kirby_kernel_probe(float *C, int ldc, const float *A, const float *B, int K) {
+    micro_32x32_kupdate(C, ldc, A, B, K);
+}

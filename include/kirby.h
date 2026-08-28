@@ -20,6 +20,10 @@ void naive_sgemm_fp32(int M, int N, int K,
 void kirby_sgemm_fp32(int M, int N, int K,
                       const float *A, const float *B, float *C);
 
+/* [仅测试用] microkernel 裸性能探针: 直通 micro_32x32_kupdate
+ * 不属于论文复现范围, 供 tools/kernel_bench.c 定标 kernel 峰值 */
+void kirby_kernel_probe(float *C, int ldc, const float *A, const float *B, int K);
+
 #ifdef __cplusplus
 }
 #endif

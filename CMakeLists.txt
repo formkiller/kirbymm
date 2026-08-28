@@ -44,6 +44,10 @@ target_link_libraries(verify PRIVATE kirbymm m)
 add_executable(bench test/bench.c)
 target_link_libraries(bench PRIVATE kirbymm naive)
 
+# ---- microkernel 裸性能定标 (隔离调度层, 修正 peak 口径) ----
+add_executable(kernel_bench tools/kernel_bench.c)
+target_link_libraries(kernel_bench PRIVATE kirbymm)
+
 # ---- KirbyMM 库 (主例程: 16x16 单瓦片 + 32x32 4-tile + MacroKernel 块遍历) ----
 add_library(kirbymm micro/primary.c)
 target_link_libraries(kirbymm PUBLIC naive)
