@@ -237,34 +237,40 @@ static void micro_dedicated_35x32(float *C, const float *A, const float *B, int 
 }
 
 /* 32×32 主例程 microkernel (论文 §IV-A, Fig.7 严格复现)
- * C: 32×32 row-major (行距 32 = 128 字节, 连续块)
+ * C: 32×32 子矩阵, 行距 ldc 元素 (§V-A 原文 b_C 为 C 直接视图: 直连原矩阵, 不打包)
+ *    ldc=32 时即连续 32×32 块 (与打包版布局等价)
  * A: col-major 32 × K (每列 32 FP32 连续)
  * B: row-major K × 32 (每行 32 FP32 连续)
  * tile 布局: za0=C[0:16,0:16] za1=C[0:16,16:32] za2=C[16:32,0:16] za3=C[16:32,16:32]
  */
 __attribute__((target("sve,sme")))
-static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K) {
-    float *Cl = C;             /* C 初值加载: 低 16 行起点 */
-    float *Ch = C + 16 * 32;   /* C 初值加载: 高 16 行起点 */
-    float *Cl2 = C;            /* 写回: 低 16 行起点 */
-    float *Ch2 = C + 16 * 32;  /* 写回: 高 16 行起点 */
-    const float *A1 = A + 16;  /* A 列后 16 行 */
-    const float *B1 = B + 16;  /* B 行后 16 列 */
+static void micro_32x32_kupdate(float *C, int ldc, const float *A, const float *B, int K) {
+    float *Cl = C;                /* C 初值加载: 低 16 行起点 */
+    float *Ch = C + 16 * ldc;     /* C 初值加载: 高 16 行起点 (偏移 16 行 × ldc) */
+    float *Cl2 = C;               /* 写回: 低 16 行起点 */
+    float *Ch2 = C + 16 * ldc;    /* 写回: 高 16 行起点 */
+    long c_row  = (long)ldc * 4 * 2; /* C 行宽 ×2 = 两次半行推进的行跳 (ldc=32 时 128B) */
+    const float *A1 = A + 16;     /* A 列后 16 行 */
+    const float *B1 = B + 16;     /* B 行后 16 列 */
     __asm__ volatile(
         "smstart sm\n\t"
         "smstart za\n\t"
         "ptrue p0.s, all\n\t"
-        /* 加载 C 初值进 4 tile (完整 C += A*B 语义) */
+        /* 加载 C 初值进 4 tile (完整 C += A*B 语义)
+         * 行内: Cl 先进左半 (za0), +64B 进右半 (za1), 再 +c_row-64B 到下一行首
+         * 即每循环净进 c_row = 2*ldc 元素 = 整行宽 */
         "mov w12, #0\n\t"
         "3:\n\t"
         "ld1w {za0h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
         "add %[Cl], %[Cl], #64\n\t"
         "ld1w {za1h.s[w12, 0]}, p0/z, [%[Cl]]\n\t"
-        "add %[Cl], %[Cl], #64\n\t"
+        "add %[Cl], %[Cl], %[cr]\n\t"
+        "sub %[Cl], %[Cl], #64\n\t"
         "ld1w {za2h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
         "add %[Ch], %[Ch], #64\n\t"
         "ld1w {za3h.s[w12, 0]}, p0/z, [%[Ch]]\n\t"
-        "add %[Ch], %[Ch], #64\n\t"
+        "add %[Ch], %[Ch], %[cr]\n\t"
+        "sub %[Ch], %[Ch], #64\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 3b\n\t"
@@ -284,17 +290,19 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
         "add %[B1], %[B1], #128\n\t"
         "subs %w[K], %w[K], #1\n\t"
         "b.ne 1b\n\t"
-        /* 写回: za0-za3 的 16 行各存到 C (行距 128 字节) */
+        /* 写回: za0-za3 的 16 行各存到 C (行内同载入: 左半+64B 右半+行跳) */
         "mov w12, #0\n\t"
         "2:\n\t"
         "st1w {za0h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
         "add %[Cl2], %[Cl2], #64\n\t"
         "st1w {za1h.s[w12, 0]}, p0, [%[Cl2]]\n\t"
-        "add %[Cl2], %[Cl2], #64\n\t"
+        "add %[Cl2], %[Cl2], %[cr]\n\t"
+        "sub %[Cl2], %[Cl2], #64\n\t"
         "st1w {za2h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
         "add %[Ch2], %[Ch2], #64\n\t"
         "st1w {za3h.s[w12, 0]}, p0, [%[Ch2]]\n\t"
-        "add %[Ch2], %[Ch2], #64\n\t"
+        "add %[Ch2], %[Ch2], %[cr]\n\t"
+        "sub %[Ch2], %[Ch2], #64\n\t"
         "add w12, w12, #1\n\t"
         "cmp w12, #16\n\t"
         "b.ne 2b\n\t"
@@ -303,7 +311,7 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
         : [A] "+r" (A), [A1] "+r" (A1), [B] "+r" (B), [B1] "+r" (B1),
           [Cl] "+r" (Cl), [Ch] "+r" (Ch), [Cl2] "+r" (Cl2), [Ch2] "+r" (Ch2),
           [K] "+r" (K)
-        :
+        : [cr] "r" (c_row)
         : "memory", "w12"
     );
 }
@@ -319,10 +327,12 @@ static void micro_32x32_kupdate(float *C, const float *A, const float *B, int K)
  *   L4 (jj, sj=32):   blkn 内 N 再分块 (L2 驻留)
  *   L5 (ii, si=32):   blkm 内 M 再分块 = microkernel (L1 驻留)
  *
- * Packing (论文 §V, 当前简单实现, §V-B 将用 ZA-tile 优化):
+ * Packing (论文 §V):
  *   A_block: blkm×blkk, 按 32 行子块组织, 每子块 col-major 32×blkk (列距 32)
+ *            ZA-tile 隐式转置 (§V-B, za_transpose_16x16)
  *   B_panel: blkk×blkn, 按 32 列子块组织, 每子块 row-major blkk×32 (行距 32)
- *   C_blk:   32×32 连续, pack/unpack microkernel 用
+ *   C: 不打包 — Algorithm 1 的 b_C 为 C 直接视图, microkernel 经 ldc 直连,
+ *      对应 Eq.6 "未打包的 C 元素" 的流式面板假设
  *
  * M=N=16: 走 16×16 单瓦片 SME (验证用)
  * M,N 是 32 倍数: 走 5 层循环 (blkm/blkn 自适应 ≤128)
@@ -360,10 +370,10 @@ void kirby_sgemm_fp32(int M, int N, int K,
 
     const int BLKM = 128, BLKN = 128, BLKK = 128, SI = 32, SJ = 32;
 
-    /* 预分配 packing 缓冲 (一次, 全程复用) */
+    /* 预分配 packing 缓冲 (一次, 全程复用)
+     * C 不打包: §V-A 原文 b_C 为 C 直接视图, microkernel 经 ldc 直连原 C */
     float *A_block = (float *)malloc(sizeof(float) * BLKM * BLKK);  /* 128×128 */
     float *B_panel = (float *)malloc(sizeof(float) * BLKK * BLKN);  /* 128×128 */
-    float *C_blk   = (float *)malloc(sizeof(float) * SI * SJ);      /* 32×32 */
 
     /* L1: j 循环 (blkn) */
     for (int j = 0; j < N; j += BLKN) {
@@ -421,33 +431,24 @@ void kirby_sgemm_fp32(int M, int N, int K,
                     int sj_cur = (jj + SJ <= blkn) ? SJ : (blkn - jj);
                     int jb = jj / SJ;
 
-                    /* L5: ii 循环 (si=32) = microkernel */
+                    /* L5: ii 循环 (si=32) = microkernel
+                     * 直连 C: 传原矩阵指针 + 行距 N (Algorithm 1 的 b_C 直接视图) */
                     for (int ii = 0; ii < blkm; ii += SI) {
                         int si_cur = (ii + SI <= blkm) ? SI : (blkm - ii);
                         int ib = ii / SI;
+                        (void)si_cur;
 
-                        /* pack C[i+ii:i+ii+si, j+jj:j+jj+sj] → C_blk (32×32 连续) */
-                        for (int r = 0; r < si_cur; r++)
-                            memcpy(C_blk + r * 32,
-                                   C + (size_t)(i + ii + r) * N + (j + jj),
-                                   sj_cur * sizeof(float));
-
-                        /* microkernel: C_blk += A_sub * B_sub (完整 C += A*B) */
-                        micro_32x32_kupdate(C_blk,
+                        /* microkernel: C += A_sub * B_sub (完整 C += A*B, 直连原矩阵) */
+                        micro_32x32_kupdate(C + (size_t)(i + ii) * N + (j + jj),
+                            N,                              /* ldc = 原矩阵行距 */
                             A_block + (size_t)ib * BLKK * SI,
                             B_panel + (size_t)jb * BLKK * SJ,
                             blkk);
-
-                        /* unpack C_blk → 原 C */
-                        for (int r = 0; r < si_cur; r++)
-                            memcpy(C + (size_t)(i + ii + r) * N + (j + jj),
-                                   C_blk + r * 32,
-                                   sj_cur * sizeof(float));
                     }
                 }
             }
         }
     }
 
-    free(A_block); free(B_panel); free(C_blk);
+    free(A_block); free(B_panel);
 }
