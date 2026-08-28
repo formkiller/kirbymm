@@ -2,10 +2,14 @@
  * bench.c — KirbyMM 性能基准 (naive vs kirby GFLOPS 对照)
  *
  * 测量: 多组 32 倍数规模, naive vs kirby 的 GFLOPS 与加速比
- * 对照: M4 SME 峰值 ~512 GFLOPS (0.512 TFLOPS, FP32 单核)
+ * 对照口径 (2026-08-29 kernel_bench v6 定标):
+ *   - 论文 Fig.13 M4 MicroKernel 上限 1425.13 GFLOPS (本文复现 kernel 达到其 97.6%)
+ *   - 理论峰: 1 fmopa/cycle @ 4.4GHz = 2253 GFLOPS; K=512 实测 kernel 1828~1860 (81~83%)
+ *   - 旧 "~512 GFLOPS" 口径为初版拍的估计值, 已废弃
  *
- * 注意: 当前 MacroKernel 每块有 pack/unpack malloc+memcpy 开销,
- *       大概率 kirby 比 naive 慢 — bench 会揭示瓶颈, 指导后续优化
+ * 注意: 本机 (M4) 时间戳在 SME 调用后存在冻结/清零病态, 全 GEMM 粒度
+ *       (t0 于 SME 前读取) 未受影响, 数字可信; microkernel 级计时必须走
+ *       kernel_bench v6 的差分协议, 不可直接单次计时
  *
  * 编译: cmake --build build (自动加入)
  * 运行: ./build/bench
@@ -75,9 +79,10 @@ static double bench_gflops(gemm_fn_t fn, int M, int N, int K) {
 
 int main(void) {
     printf("=== KirbyMM performance benchmark ===\n");
-    printf("M4 SME peak: ~512 GFLOPS (FP32, 0.512 TFLOPS)\n\n");
-    printf("%-10s %10s %10s %10s %10s\n", "size", "naive", "kirby", "speedup", "kirby/peak");
-    printf("------------------------------------------------------------\n");
+    printf("peak references: Fig.13 kernel 1425.13 | fmopa@4.4GHz 2253 GFLOPS\n\n");
+    printf("%-10s %10s %10s %10s %9s %9s\n", "size", "naive", "kirby", "speedup",
+           "%fig13", "%theor");
+    printf("--------------------------------------------------------------------------\n");
 
     int sizes[] = {32, 64, 128, 256, 512, 1024};
     int n = (int)(sizeof(sizes) / sizeof(sizes[0]));
@@ -85,12 +90,12 @@ int main(void) {
         int s = sizes[i];
         double gn = bench_gflops(naive_sgemm_fp32, s, s, s);
         double gk = bench_gflops(kirby_sgemm_fp32, s, s, s);
-        printf("%-10d %10.2f %10.2f %9.2fx %9.1f%%\n",
-               s, gn, gk, gk / gn, gk / 512.0 * 100);
+        printf("%-10d %10.2f %10.2f %9.2fx %8.1f%% %8.1f%%\n",
+               s, gn, gk, gk / gn, gk / 1425.13 * 100, gk / 2253.0 * 100);
     }
 
-    printf("\n(note: current MacroKernel has pack/unpack overhead per block,\n");
-    printf(" kirby may be slower than naive — this is expected pre-optimization.\n");
-    printf(" next step: pre-allocated packing buffers + ZA-tile packing.)\n");
+    printf("\n(ref: kernel-only v6 diff-protocol: ldc=256 tailD 1506 GFLOPS = 105.7% fig13;\n");
+    printf(" K=512 kernel up to 1860 GFLOPS = 82.6%% theoretical. fig13 = 1425.13 GFLOPS,\n");
+    printf(" theor = 1 fmopa/cycle @ 4.4GHz = 2253 GFLOPS. old ~512-peak calibration retired.)\n");
     return 0;
 }
